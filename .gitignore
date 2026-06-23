@@ -216,3 +216,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Data and large outputs
+*.zarr/
+*.nc
+*.h5
+*.hdf5
+data/
+outputs/
+figs/
