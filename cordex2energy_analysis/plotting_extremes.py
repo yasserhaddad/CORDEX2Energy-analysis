@@ -169,8 +169,8 @@ def _collect_data_for_kde(
     period_name: str,
     period_defs: PeriodDefs,
     models: list[str],
-    season_map: dict[int, str],
-    season: str,
+    season_map: dict[int, str] | None,
+    season: str | None,
     rl_var: str,
     per_model: bool,
     threshold: float | None = 0.0,
@@ -179,6 +179,7 @@ def _collect_data_for_kde(
 
     *flat_filtered_samples* contains only finite values above *threshold*
     (or all finite values when *threshold* is ``None``).
+    Pass ``season=None`` to include all seasons without filtering.
     """
     def _filter(arr: np.ndarray) -> np.ndarray:
         mask = np.isfinite(arr) if threshold is None else np.isfinite(arr) & (arr > threshold)
@@ -193,18 +194,24 @@ def _collect_data_for_kde(
                 continue
             t0, t1 = window
             da = ds_zonal.sel(model=model, zone=zone, time=slice(t0, t1))[rl_var]
-            months = da.time.dt.month.values
-            smask = np.array([season_map.get(m, "") for m in months]) == season
-            arr = da.values[smask]
+            if season is None or season_map is None:
+                arr = da.values
+            else:
+                months = da.time.dt.month.values
+                smask = np.array([season_map.get(m, "") for m in months]) == season
+                arr = da.values[smask]
             series_list.append(arr)
             all_vals.extend(_filter(arr).tolist())
         return series_list, np.asarray(all_vals)
     else:
         t0, t1 = period_defs[period_name]  # type: ignore[misc]
         da = ds_zonal.sel(zone=zone, time=slice(t0, t1))[rl_var]
-        months = da.time.dt.month.values
-        smask = np.array([season_map.get(m, "") for m in months]) == season
-        data_2d = da.values[:, smask]
+        if season is None or season_map is None:
+            data_2d = da.values
+        else:
+            months = da.time.dt.month.values
+            smask = np.array([season_map.get(m, "") for m in months]) == season
+            data_2d = da.values[:, smask]
         return data_2d, _filter(data_2d.ravel())
 
 
@@ -270,10 +277,13 @@ def plot_residual_load_kde(
     """
     if models is None:
         models = list(ds_residual_load_zonal.model.values)
-    if season_map is None:
-        season_map = _DEFAULT_SEASON_MAP
-    if season_order is None:
-        season_order = _DEFAULT_SEASON_ORDER
+
+    _seasonal = season_map is not None or season_order is not None
+    if _seasonal:
+        if season_map is None:
+            season_map = _DEFAULT_SEASON_MAP
+        if season_order is None:
+            season_order = _DEFAULT_SEASON_ORDER
 
     period_names = list(period_defs.keys())
     colors = _period_colors_with_defaults(period_names, period_colors)
@@ -289,15 +299,19 @@ def plot_residual_load_kde(
         _title_suffix = f"residual load > {threshold:.0f} GWh"
         _xlabel = f"Residual load above {threshold:.0f} GWh"
 
+    panels = season_order if _seasonal else [None]
+
     for zone in zones:
-        fig, axes = plt.subplots(1, len(season_order), figsize=figsize)
+        fig, axes = plt.subplots(1, len(panels), figsize=figsize)
+        if len(panels) == 1:
+            axes = [axes]
         fig.suptitle(
             f"{zone.replace('_', ' ')} — KDE of {_title_suffix}"
             f" (n={len(models)} models)",
             fontsize=12,
         )
 
-        for ax, season in zip(axes, season_order):
+        for ax, season in zip(axes, panels):
             # Collect all filtered values across periods to build a shared x-axis.
             all_vals: list[float] = []
             for period_name in period_names:
@@ -308,8 +322,9 @@ def plot_residual_load_kde(
                 )
                 all_vals.extend(vals.tolist())
 
+            panel_title = season if season is not None else "All seasons"
             if len(all_vals) < 50:
-                ax.set_title(season, fontsize=11)
+                ax.set_title(panel_title, fontsize=11)
                 ax.set_visible(False)
                 continue
 
@@ -329,9 +344,9 @@ def plot_residual_load_kde(
                 ax.fill_between(x_grid, q10, q90, alpha=0.18, color=color)
                 ax.plot(x_grid, med, color=color, lw=2, label=period_name)
 
-            ax.set_title(season, fontsize=11)
+            ax.set_title(panel_title, fontsize=11)
             ax.set_xlabel(_xlabel, fontsize=9)
-            ax.set_ylabel("Density" if season == season_order[0] else "", fontsize=9)
+            ax.set_ylabel("Density" if ax is axes[0] else "", fontsize=9)
             ax.tick_params(labelsize=8)
 
         axes[-1].legend(fontsize=8, title="Period", title_fontsize=8)
@@ -1994,8 +2009,10 @@ def plot_seasonal_component_anomaly_distributions(
                     continue
                 for val in df_g[col].dropna():
                     rows.append({"Component": lbl, "Group": grp_val, "Value": float(val)})
+        if not rows:
+            return pd.DataFrame(columns=["Component", "Group", "Value"]), []
         df_melt = pd.DataFrame(rows)
-        present = [lbl for lbl in comp_labels if lbl in df_melt["Component"].unique()] if rows else []
+        present = [lbl for lbl in comp_labels if lbl in df_melt["Component"].unique()]
         return df_melt, present
 
     def _draw_zone_ax(ax, df_melt, present, hue_order, pal_list):
@@ -2090,4 +2107,267 @@ def plot_seasonal_component_anomaly_distributions(
         )
         plt.tight_layout(rect=[0, 0.06, 1, 1])
         _save(fig, f"component_anomaly_seasonal_season_{season}")
+        plt.show()
+
+
+# ---------------------------------------------------------------------------
+# Diurnal profile of extreme events
+# ---------------------------------------------------------------------------
+
+
+def plot_event_diurnal_profile(
+    df_diurnal: pd.DataFrame,
+    zones: list,
+    season_order: list[str],
+    period_defs: "PeriodDefs | None" = None,
+    zone_colors: "dict[str, str] | None" = None,
+    period_colors: "dict[str, str] | None" = None,
+    season_colors: "dict[str, str] | None" = None,
+    supply_scenario: "str | None" = None,
+    supply_year: "int | str | None" = None,
+    figsize_seasonal: tuple = (14, 9),
+    figsize_pv: tuple = (14, 8),
+    path_savefig: "Path | str | None" = None,
+) -> None:
+    """Diurnal distribution of extreme-event timesteps and PV generation context.
+
+    Produces two figure sets:
+
+    1. **Seasonal distribution grid** (one figure, 2×2 season panels): percentage
+       of event timesteps falling in each hour of the day, one line per zone,
+       ensemble median ± IQR across all models and periods.  Shows *when* during
+       the day events preferentially occur in each season.
+
+    2. **PV context by zone** (one figure per season, 2×3 zone panels): percentage
+       of event timesteps per hour (bars) overlaid with mean PV during events
+       (solid) versus the reference-period climatological PV (dashed) on a
+       secondary axis.  The gap between the two lines is directly comparable to
+       the PV anomaly used in driver-attribution plots.
+
+    Parameters
+    ----------
+    df_diurnal :
+        Output of ``extract_event_diurnal_profiles``.
+    zones :
+        Ordered zone values (fills 2×3 grid for Figure 2).
+    season_order :
+        Season labels in display order, e.g. ``["DJF", "MAM", "JJA", "SON"]``.
+    period_defs :
+        Period definitions, used only to order periods.  ``None`` → infer from data.
+    zone_colors :
+        ``{zone_str: colour}`` for Figure 1 lines.  Defaults to a tab10 palette.
+    period_colors :
+        ``{period_name: colour}`` for Figure 2.
+    season_colors :
+        ``{season_label: colour}`` for Figure 2 PV lines.
+    supply_scenario, supply_year :
+        Optional annotation in figure titles.
+    figsize_seasonal :
+        Figure size for the seasonal distribution grid.
+    figsize_pv :
+        Figure size for each PV-context figure (one per season).
+    path_savefig :
+        Save directory; files are named ``diurnal_distribution.png``,
+        ``diurnal_pv_context_{season}.png``.
+    """
+    import matplotlib.patches as mpatches
+
+    subtitle = f" ({supply_scenario} {supply_year})" if supply_scenario else ""
+
+    period_order = list(period_defs.keys()) if period_defs is not None else sorted(df_diurnal["period"].unique())
+    zone_strs    = [str(z) for z in zones]
+
+    # ── Default palettes ──────────────────────────────────────────────────────
+    if zone_colors is None:
+        _zpal = sns.color_palette("tab10", len(zone_strs))
+        zone_colors = dict(zip(zone_strs, _zpal))
+    if period_colors is None:
+        period_colors = _period_colors_with_defaults(period_order, None)
+    if season_colors is None:
+        _sc = sns.color_palette("husl", len(season_order))
+        season_colors = dict(zip(season_order, _sc))
+
+    hours_sorted = sorted(df_diurnal["hour"].unique())
+
+    def _save(fig: "plt.Figure", stem: str) -> None:
+        if path_savefig is None:
+            return
+        p = Path(path_savefig)
+        safe = stem.replace(" ", "_").replace("°", "deg").replace(".", "p")
+        if p.suffix:
+            dest = p.parent / f"{p.stem}_{safe}{p.suffix}"
+        else:
+            p.mkdir(parents=True, exist_ok=True)
+            dest = p / f"{safe}.png"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(dest, dpi=150, bbox_inches="tight")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Figure 1 — diurnal distribution of event timesteps (all zones)
+    # ─────────────────────────────────────────────────────────────────────────
+    n_rows, n_cols = 2, 2
+    fig1, axes1 = plt.subplots(
+        n_rows, n_cols, figsize=figsize_seasonal, squeeze=False, sharey=True
+    )
+    fig1.suptitle(
+        f"Diurnal distribution of extreme events{subtitle}\n"
+        f"(% of event timesteps per hour; ensemble median ± IQR across models × periods)",
+        fontsize=11, fontweight="bold", y=1.01,
+    )
+
+    # Global y-limit for Figure 1: max q75 across all season × zone × hour combinations.
+    # Set after plotting so the shared axis encompasses the full data range.
+    _pct_ymax = (
+        df_diurnal.groupby(["season", "zone", "hour"])["pct_event_steps"]
+        .quantile(0.75)
+        .max()
+    )
+
+    for ax, season in zip(axes1.flatten(), season_order):
+        df_s = df_diurnal[df_diurnal["season"] == season]
+
+        for zone_str in zone_strs:
+            df_sz = df_s[df_s["zone"] == zone_str]
+            if df_sz.empty:
+                continue
+
+            grp = df_sz.groupby("hour")["pct_event_steps"]
+            med = grp.median().reindex(hours_sorted)
+            q25 = grp.quantile(0.25).reindex(hours_sorted)
+            q75 = grp.quantile(0.75).reindex(hours_sorted)
+
+            col = zone_colors.get(zone_str, "gray")
+            ax.plot(hours_sorted, med.values, color=col, lw=1.8,
+                    label=zone_str.replace("_", " "))
+            ax.fill_between(hours_sorted, q25.values, q75.values,
+                            color=col, alpha=0.15)
+
+        ax.set_title(season, fontsize=10)
+        ax.set_xlabel("Hour of day (UTC)")
+        ax.set_ylabel("% of event timesteps")
+        ax.set_xticks(hours_sorted)
+        ax.set_xlim(hours_sorted[0] - 1, hours_sorted[-1] + 1)
+        sns.despine(ax=ax)
+
+    # Apply shared y-limit after all data is drawn.
+    axes1.flat[0].set_ylim(0, _pct_ymax * 1.15)
+
+    zone_handles = [
+        mpatches.Patch(facecolor=zone_colors.get(z, "gray"),
+                       label=z.replace("_", " "))
+        for z in zone_strs
+    ]
+    fig1.legend(handles=zone_handles, loc="lower center",
+                ncol=min(len(zone_strs), 6), fontsize=8,
+                framealpha=0.9, title="Zone", title_fontsize=8)
+    plt.tight_layout(rect=[0, 0.07, 1, 1])
+    _save(fig1, "diurnal_distribution")
+    plt.show()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Figure set 2 — PV context by zone (one figure per season)
+    # ─────────────────────────────────────────────────────────────────────────
+    has_pv = df_diurnal["mean_pv_clim"].notna().any()
+    if not has_pv:
+        return
+
+    uniform_pct = 100.0 / len(hours_sorted)
+
+    for season in season_order:
+        df_s = df_diurnal[df_diurnal["season"] == season]
+
+        # Pre-compute global y-limits for this season so all subplots share the
+        # same scale.  Bar axis uses the max q75 of pct_event_steps; PV axis uses
+        # the global max of both the event and total median PV profiles.
+        _pct_s_ymax = (
+            df_s.groupby(["zone", "hour"])["pct_event_steps"].quantile(0.75).max()
+        )
+        _pv_s_ymax = max(
+            df_s.groupby(["zone", "hour"])["mean_pv_event"].median().max(),
+            df_s.groupby(["zone", "hour"])["mean_pv_clim"].median().max(),
+        )
+
+        fig2, axes2 = plt.subplots(2, 3, figsize=figsize_pv, squeeze=False, sharey=True)
+        fig2.suptitle(
+            f"Diurnal PV context for extreme events — {season}{subtitle}\n"
+            f"Bars: % of event timesteps (ensemble median)  |  "
+            f"Lines: mean PV during events (solid) vs reference-period climatology (dashed, grey)",
+            fontsize=10, fontweight="bold", y=1.01,
+        )
+
+        pv_axes: list = []  # collect twin axes for post-loop y-limit sync
+
+        for ax, zone_str in zip(axes2.flatten(), zone_strs):
+            df_sz = df_s[df_s["zone"] == zone_str]
+            if df_sz.empty:
+                ax.set_visible(False)
+                pv_axes.append(None)
+                continue
+
+            grp = df_sz.groupby("hour")
+            pct_med     = grp["pct_event_steps"].median().reindex(hours_sorted)
+            pv_ev_med   = grp["mean_pv_event"].median().reindex(hours_sorted)
+            pv_clim_med = grp["mean_pv_clim"].median().reindex(hours_sorted)
+            pv_ev_q25   = grp["mean_pv_event"].quantile(0.25).reindex(hours_sorted)
+            pv_ev_q75   = grp["mean_pv_event"].quantile(0.75).reindex(hours_sorted)
+
+            # Fill NaN in PV-during-events (hours with no events) with the
+            # climatological value, then interpolate any remaining gaps.
+            pv_clim_med = pv_clim_med.interpolate(method="index", limit_direction="both")
+            pv_ev_med   = pv_ev_med.fillna(pv_clim_med).interpolate(
+                method="index", limit_direction="both"
+            )
+            pv_ev_q25 = pv_ev_q25.fillna(pv_clim_med).interpolate(
+                method="index", limit_direction="both"
+            )
+            pv_ev_q75 = pv_ev_q75.fillna(pv_clim_med).interpolate(
+                method="index", limit_direction="both"
+            )
+
+            ax_bar = ax
+            ax_pv  = ax.twinx()
+            pv_axes.append(ax_pv)
+
+            col = season_colors.get(season, "#888888")
+
+            ax_bar.bar(hours_sorted, pct_med.values, width=2.2,
+                       color=col, alpha=0.45, zorder=2, label="% event steps")
+            ax_bar.axhline(uniform_pct, color="black", lw=0.7, linestyle="--", zorder=1)
+            ax_bar.set_ylabel("% of event timesteps", fontsize=8)
+            ax_bar.set_xlabel("Hour of day (UTC)", fontsize=8)
+            ax_bar.set_xticks(hours_sorted)
+            ax_bar.tick_params(axis="both", labelsize=7)
+
+            ax_pv.plot(hours_sorted, pv_ev_med.values, color=col, lw=2.0,
+                       linestyle="-", label="PV during events")
+            ax_pv.fill_between(hours_sorted, pv_ev_q25.values, pv_ev_q75.values,
+                               color=col, alpha=0.2)
+            ax_pv.plot(hours_sorted, pv_clim_med.values, color="grey", lw=1.5,
+                       linestyle="--", label="PV climatology (reference period)")
+            ax_pv.set_ylabel("Mean PV (GW)", fontsize=8)
+            ax_pv.tick_params(axis="y", labelsize=7)
+
+            ax.set_title(zone_str.replace("_", " "), fontsize=9)
+
+        # Sync bar y-limits (sharey=True links primary axes; set once after drawing).
+        axes2.flat[0].set_ylim(0, _pct_s_ymax * 1.15)
+        # Sync twin PV axes manually (twinx axes are independent of each other).
+        _pv_ylim = (0, _pv_s_ymax * 1.1) if np.isfinite(_pv_s_ymax) and _pv_s_ymax > 0 else (0, 1)
+        for ax_pv in pv_axes:
+            if ax_pv is not None:
+                ax_pv.set_ylim(*_pv_ylim)
+
+        # Legend
+        season_patch = mpatches.Patch(facecolor=season_colors.get(season, "gray"),
+                                      alpha=0.5, label="% of event timesteps (bars)")
+        ref_line  = plt.Line2D([], [], color="black", lw=0.7,
+                               linestyle="--", label=f"Uniform ({uniform_pct:.1f}% / bin)")
+        ev_line   = plt.Line2D([], [], color=season_colors.get(season, "gray"),
+                               lw=2, linestyle="-", label="Mean PV during events")
+        tot_line  = plt.Line2D([], [], color="grey", lw=1.5,
+                               linestyle="--", label="PV climatology (reference period)")
+        fig2.legend(handles=[season_patch, ref_line, ev_line, tot_line],
+                    loc="lower center", ncol=4, fontsize=8, framealpha=0.9)
+        plt.tight_layout(rect=[0, 0.07, 1, 1])
+        _save(fig2, f"diurnal_pv_context_{season}")
         plt.show()

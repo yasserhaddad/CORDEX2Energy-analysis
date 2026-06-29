@@ -20,7 +20,6 @@ import os
 from pathlib import Path
 
 import dask
-import numpy as np
 import pandas as pd
 import xarray as xr
 
@@ -195,11 +194,117 @@ def load_cordex_energy_data(
         "ds_cooling_demand": ds_cooling_demand,
     }
 
+def load_cerra_energy_data(
+    path_c2e: Path,
+    path_energy_europe: Path,
+    turbine_fn: str,
+    name_to_iso2: dict,
+) -> dict:
+    """Load CERRA-derived energy datasets for residual load computation."""
+    print("  Loading CERRA PV capacity factors …")
+    ds_pv = xr.open_dataset(
+        path_energy_europe / "pv" / "cerra" / "pv_tyndp_agg_cerra.nc"
+    )
+
+    print("  Loading CERRA onshore wind capacity factors …")
+    ds_wind = xr.open_dataset(
+        path_energy_europe / "wind_power" / "cerra"
+        / f"wind_power_tyndp_agg_cerra_{turbine_fn}.nc"
+    )
+
+    print("  Loading CERRA offshore wind capacity factors …")
+    _path_wind_off = (
+        path_energy_europe / "wind_power" / "cerra"
+        / f"wind_power_offshore_cerra_{turbine_fn}.nc"
+    )
+    if _path_wind_off.exists():
+        _ds_wind_offshore_raw = xr.open_dataset(_path_wind_off)
+        ds_wind_offshore = _ds_wind_offshore_raw.assign_coords(
+            country=[
+                name_to_iso2.get(str(c).strip(), str(c).strip())
+                for c in _ds_wind_offshore_raw.country.values
+            ]
+        )
+    else:
+        print("    [INFO] Offshore wind not available for CERRA — using zeros.")
+        ds_wind_offshore = xr.zeros_like(ds_wind)
+
+    _c2e_cerra_dir = path_c2e / "CERRA" / "output_variables"
+
+    print("  Loading CERRA hydro run-of-river …")
+    df_hydro_ror = pd.read_csv(
+        _c2e_cerra_dir / "hydro_ror_CERRA.csv",
+        index_col=0,
+    )
+    ds_hydro_ror = preprocess_hydro_ror(
+        df_hydro_ror, name_to_iso2, freq="3h", var_name="ror"
+    ).sel(time=slice("1991", "2020"))
+
+    print("  Loading CERRA hydro inflow …")
+    df_hydro_inflow = pd.read_csv(
+        _c2e_cerra_dir / "hydro_inflow_CERRA.csv",
+        index_col=0,
+    )
+    ds_hydro_inflow = xr.DataArray(
+        df_hydro_inflow.values,
+        dims=["country", "time"],
+        coords={
+            "country": [
+                name_to_iso2.get(str(c).strip(), str(c).strip())
+                for c in df_hydro_inflow.index
+            ],
+            "time": pd.to_datetime(df_hydro_inflow.columns),
+        },
+        name="inflow",
+    ).to_dataset()
+
+    print("  Loading CERRA heating demand …")
+    df_heating = pd.read_csv(
+        _c2e_cerra_dir / "heating-demand_CERRA.csv",
+        index_col=0,
+    )
+    ds_heating_demand = xr.DataArray(
+        df_heating.values,
+        dims=["country", "time"],
+        coords={
+            "country": [name_to_iso2.get(str(c).strip(), str(c).strip()) for c in df_heating.index],
+            "time": pd.to_datetime(df_heating.columns),
+        },
+        name="heating_demand",
+    ).to_dataset()
+
+    print("  Loading CERRA cooling demand …")
+    df_cooling = pd.read_csv(
+        _c2e_cerra_dir / "cooling-demand_CERRA.csv",
+        index_col=0,
+    )
+    ds_cooling_demand = xr.DataArray(
+        df_cooling.values,
+        dims=["country", "time"],
+        coords={
+            "country": [name_to_iso2.get(str(c).strip(), str(c).strip()) for c in df_cooling.index],
+            "time": pd.to_datetime(df_cooling.columns),
+        },
+        name="cooling_demand",
+    ).to_dataset()
+
+    return {
+        "ds_pv": ds_pv.sel(time=slice("1991", "2020")),
+        "ds_wind": ds_wind.sel(time=slice("1991", "2020")),
+        "ds_wind_offshore": ds_wind_offshore.sel(time=slice("1991", "2020")),
+        "ds_hydro_ror": ds_hydro_ror.sel(time=slice("1991", "2020")),
+        "ds_hydro_inflow": ds_hydro_inflow.sel(time=slice("1991", "2020")),
+        "ds_heating_demand": ds_heating_demand.sel(time=slice("1991", "2020")),
+        "ds_cooling_demand": ds_cooling_demand.sel(time=slice("1991", "2020")),
+    }
+
+
 if __name__ == "__main__":
     # ── CLI ───────────────────────────────────────────────────────────────────────
     parser = argparse.ArgumentParser(
         description=(
-            "Compute TYNDP-scenario residual load from CORDEX climate projections."
+            "Compute TYNDP-scenario residual load from CORDEX climate projections "
+            "or the CERRA reanalysis."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -222,8 +327,8 @@ if __name__ == "__main__":
         "--climate_scenario",
         type=str,
         default="rcp85",
-        choices=["rcp26", "rcp45", "rcp85"],
-        help="CORDEX RCP climate scenario.",
+        choices=["rcp26", "rcp45", "rcp85", "none"],
+        help="CORDEX RCP climate scenario. Use 'none' when --climate_model is 'cerra'.",
     )
     parser.add_argument(
         "--demand_scenario",
@@ -360,18 +465,20 @@ if __name__ == "__main__":
     supply_year = args.supply_year
     rolling_window_residual_load = args.rolling_window_residual_load
 
+    is_cerra = climate_model.lower() == "cerra"
+
     # Map CLI supply scenario to the column suffix used in the TYNDP Excel files.
     _SUPPLY_SCENARIO_MAP = {"LOW": "LOW", "BE": "Best Estimate", "HIGH": "HIGH"}
     supply_scenario_col = _SUPPLY_SCENARIO_MAP[supply_scenario]
 
     # Derive the C2E model prefix (drops the ensemble member, e.g. _r1i1p1).
-    model_prefix = "_".join(climate_model.split("_")[:-1])
+    model_prefix = "cerra" if is_cerra else "_".join(climate_model.split("_")[:-1])
 
     # Turbine name as it appears in filenames (/ → _).
     turbine_fn = args.turbine.replace("/", "_")
 
     # Short RCP suffix used in some C2E filenames (e.g. "85" from "rcp85").
-    rcp_suffix = climate_scenario[-2:]
+    rcp_suffix = "none" if is_cerra else climate_scenario[-2:]
 
     print(f"Climate model    : {climate_model}")
     print(f"Climate scenario : {climate_scenario}")
@@ -419,11 +526,8 @@ if __name__ == "__main__":
             _run_tag += "_prosumer"
 
     # Output directory: one subfolder per run configuration.
-    path_out = (
-        path_data_extremes / "residual_load"
-        / f"{climate_model}_{climate_scenario}"
-        / _run_tag
-    )
+    _model_subdir = "cerra" if is_cerra else f"{climate_model}_{climate_scenario}"
+    path_out = path_data_extremes / "residual_load" / _model_subdir / _run_tag
 
     for p in (path_baseload_cache, path_out):
         p.mkdir(parents=True, exist_ok=True)
@@ -491,26 +595,35 @@ if __name__ == "__main__":
     gdf_tyndp_zones = drop_overlapping_zones(gdf_tyndp_zones)
     print(f"  {len(gdf_tyndp_zones)} zones after dropping overlapping geometries.")
 
-    # ── Load CORDEX energy datasets ───────────────────────────────────────────────
+    # ── Load energy datasets ──────────────────────────────────────────────────────
 
-    print("\n── Loading CORDEX energy data ───────────────────────────────────────────────")
-    cordex_data = load_cordex_energy_data(
-        path_c2e=path_c2e,
-        path_energy_europe=path_data_energy_europe,
-        climate_model=climate_model,
-        model_prefix=model_prefix,
-        climate_scenario=climate_scenario,
-        rcp_suffix=rcp_suffix,
-        turbine_fn=turbine_fn,
-        name_to_iso2=C2E_NAME_TO_ISO2,
-    )
-    ds_pv = cordex_data["ds_pv"]
-    ds_wind = cordex_data["ds_wind"]
-    ds_wind_offshore = cordex_data["ds_wind_offshore"]
-    ds_hydro_ror = cordex_data["ds_hydro_ror"]
-    ds_hydro_inflow = cordex_data["ds_hydro_inflow"]
-    ds_heating_demand = cordex_data["ds_heating_demand"]
-    ds_cooling_demand = cordex_data["ds_cooling_demand"]
+    if is_cerra:
+        print("\n── Loading CERRA energy data ────────────────────────────────────────────────")
+        energy_data = load_cerra_energy_data(
+            path_c2e=path_c2e,
+            path_energy_europe=path_data_energy_europe,
+            turbine_fn=turbine_fn,
+            name_to_iso2=C2E_NAME_TO_ISO2,
+        )
+    else:
+        print("\n── Loading CORDEX energy data ───────────────────────────────────────────────")
+        energy_data = load_cordex_energy_data(
+            path_c2e=path_c2e,
+            path_energy_europe=path_data_energy_europe,
+            climate_model=climate_model,
+            model_prefix=model_prefix,
+            climate_scenario=climate_scenario,
+            rcp_suffix=rcp_suffix,
+            turbine_fn=turbine_fn,
+            name_to_iso2=C2E_NAME_TO_ISO2,
+        )
+    ds_pv = energy_data["ds_pv"]
+    ds_wind = energy_data["ds_wind"]
+    ds_wind_offshore = energy_data["ds_wind_offshore"]
+    ds_hydro_ror = energy_data["ds_hydro_ror"]
+    ds_hydro_inflow = energy_data["ds_hydro_inflow"]
+    ds_heating_demand = energy_data["ds_heating_demand"]
+    ds_cooling_demand = energy_data["ds_cooling_demand"]
 
     # ── Compute or load baseload ──────────────────────────────────────────────────
 
@@ -665,7 +778,7 @@ if __name__ == "__main__":
     # Attach run metadata as global attributes.
     _attrs = {
         "climate_model": climate_model,
-        "climate_scenario": climate_scenario,
+        "climate_scenario": "reanalysis" if is_cerra else climate_scenario,
         "demand_scenario": demand_scenario,
         "demand_year": demand_year,
         "supply_scenario": supply_scenario_col,
