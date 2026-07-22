@@ -2,6 +2,20 @@
 
 from .analysis import *
 from .plotting import *
+from .plotting_paper import (
+    PaperStyle,
+    load_country_geometry,
+    plot_country_choropleth,
+    plot_mean_state_maps,
+    plot_tail_survival,
+    plot_sub_daily_regime,
+    plot_multi_day_regime,
+    plot_threshold_calibration,
+    plot_zone_season_change,
+    plot_significance,
+    plot_level_vs_persistence,
+    plot_threshold_sensitivity,
+)
 from .plotting_extremes import (
     resolve_model_periods,
     plot_residual_load_kde,
@@ -111,4 +125,18 @@ __all__ = [
     "compute_comprehensive_event_metrics",
     # extremes_analysis — derived analyses
     "compile_and_compare_periods",
+    # paper figures — derived tables + figure builders
+    "PaperStyle",
+    "load_country_geometry",
+    "plot_country_choropleth",
+    "plot_mean_state_maps",
+    "plot_tail_survival",
+    "plot_sub_daily_regime",
+    "plot_multi_day_regime",
+    "plot_threshold_calibration",
+    "plot_zone_season_change",
+    "plot_significance",
+    "plot_level_vs_persistence",
+    "plot_cooccurrence",
+    "plot_threshold_sensitivity",
 ]

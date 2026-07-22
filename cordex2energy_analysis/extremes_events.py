@@ -272,6 +272,9 @@ def calculate_climatological_baseline(ds_reference_period, time_dim="time"):
     target_vars = ["total_demand", "gen_pv", "gen_wind_on", "gen_wind_off", "gen_hydro_ror"]
     if "reservoir_dispatch_gwh" in ds_reference_period.data_vars:
         target_vars.append("reservoir_dispatch_gwh")
+    # Battery variables are optional: the lumped ('system') flexibility scheme writes
+    # only the combined `battery_dispatch_gwh`, while the split ('market') scheme also
+    # writes the prosumer/utility breakdown.  Take whichever are present.
     for _bat_var in ["battery_dispatch_gwh", "prosumer_dispatch_gwh", "utility_dispatch_gwh"]:
         if _bat_var in ds_reference_period.data_vars:
             target_vars.append(_bat_var)
@@ -335,6 +338,8 @@ def compute_continuous_system_metrics(
             expected_res - ds_components["reservoir_dispatch_gwh"]
         ).clip(min=0.0)
 
+    # `battery_dispatch_gwh` is the *total* storage dispatch in both the split
+    # ('market') and lumped ('system') schemes, so this anomaly is scheme-independent.
     if (
         "battery_dispatch_gwh" in ds_components.data_vars
         and "battery_dispatch_gwh" in ds_baseline.data_vars

@@ -27,6 +27,8 @@ from .extremes_analysis import (
     extract_evt_duration_severity_records,
     compute_unserved_energy_fraction,
     compute_flexibility_attenuation_metrics,
+    battery_split_mode,
+    flex_metric_columns,
 )
 
 __all__ = [
@@ -44,4 +46,6 @@ __all__ = [
     "extract_evt_duration_severity_records",
     "compute_unserved_energy_fraction",
     "compute_flexibility_attenuation_metrics",
+    "battery_split_mode",
+    "flex_metric_columns",
 ]

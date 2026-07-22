@@ -117,13 +117,42 @@ def _period_colors_with_defaults(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Inter-model spread convention
+# ---------------------------------------------------------------------------
+SPREAD_PERCENTILES = {"iqr": (25.0, 75.0), "minmax": (0.0, 100.0)}
+SPREAD_LABEL = {"iqr": "IQR (P25–P75)", "minmax": "min–max"}
+
+
+def spread_qpair(spread: str = "iqr") -> "tuple[float, float]":
+    """Return the (low, high) percentile pair for a model-spread convention.
+
+    ``"iqr"`` → (25, 75); ``"minmax"`` → (0, 100). With a small ensemble
+    (n ≈ 9) the 5th/95th percentiles are not meaningfully estimable, so only the
+    robust IQR and the honest full range are offered.
+    """
+    try:
+        return SPREAD_PERCENTILES[spread]
+    except KeyError as exc:
+        raise ValueError(
+            f"spread must be one of {list(SPREAD_PERCENTILES)}; got {spread!r}"
+        ) from exc
+
+
+def model_spread_bounds(values, spread: str = "iqr", axis=0):
+    """Low/high inter-model spread bounds for ``values`` along ``axis``."""
+    lo, hi = spread_qpair(spread)
+    return np.nanpercentile(values, lo, axis=axis), np.nanpercentile(values, hi, axis=axis)
+
+
 def _kde_envelope(
     data_2d,
     x_grid: np.ndarray,
     bw: float = 0.12,
     threshold: float | None = 0.0,
+    spread: str = "iqr",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | tuple[None, None, None]:
-    """Compute KDE for each model row; return (median, q10, q90) across models.
+    """Compute KDE for each model row; return (median, lo, hi) across models.
 
     Parameters
     ----------
@@ -156,11 +185,8 @@ def _kde_envelope(
     if len(kdes) < 2:
         return None, None, None
     arr = np.stack(kdes)
-    return (
-        np.median(arr, axis=0),
-        np.percentile(arr, 10, axis=0),
-        np.percentile(arr, 90, axis=0),
-    )
+    lo, hi = model_spread_bounds(arr, spread=spread, axis=0)
+    return np.median(arr, axis=0), lo, hi
 
 
 def _collect_data_for_kde(
@@ -233,12 +259,14 @@ def plot_residual_load_kde(
     figsize: tuple = (18, 3.5),
     path_savefig: Path | str | None = None,
     threshold: float | None = 0.0,
+    spread: str = "iqr",
 ) -> None:
     """Plot ensemble KDE envelopes of residual load per zone and season.
 
     One figure per zone, one sub-panel per season. Each panel shows three
     overlaid KDE curves (one per period): the solid line is the ensemble median
-    and the shaded band spans the 10th–90th model percentile.
+    and the shaded band spans the inter-model ``spread`` interval
+    (``"iqr"`` → P25–P75, ``"minmax"`` → full range).
 
     Supports both fixed time periods (same window for all models) and per-model
     periods such as Global Warming Levels; see module docstring.
@@ -338,10 +366,12 @@ def plot_residual_load_kde(
                     models, season_map, season, rl_var, per_model,
                     threshold=threshold,
                 )
-                med, q10, q90 = _kde_envelope(data_2d, x_grid, bw=bw, threshold=threshold)
+                med, q_lo, q_hi = _kde_envelope(
+                    data_2d, x_grid, bw=bw, threshold=threshold, spread=spread
+                )
                 if med is None:
                     continue
-                ax.fill_between(x_grid, q10, q90, alpha=0.18, color=color)
+                ax.fill_between(x_grid, q_lo, q_hi, alpha=0.18, color=color)
                 ax.plot(x_grid, med, color=color, lw=2, label=period_name)
 
             ax.set_title(panel_title, fontsize=11)
@@ -965,12 +995,14 @@ def plot_seasonal_conditional_metrics(
     figsize: tuple = (15, 8),
     supply_scenario: str = "",
     supply_year="",
-    sharey: bool = False
+    sharey: bool = False,
+    spread: str = "iqr",
 ) -> None:
     """Grouped boxplots of seasonal-conditional EVT metrics — one box per (season, period).
 
-    One figure is produced per metric. Each box shows the inter-model spread
-    (median line, IQR box, whiskers at 5th/95th percentile).
+    One figure is produced per metric. Each box shows the inter-model spread:
+    median line, IQR box, and whiskers spanning the ``spread`` interval
+    (``"iqr"`` → P25–P75, i.e. the box edges; ``"minmax"`` → full ensemble range).
 
     Parameters
     ----------
@@ -995,6 +1027,7 @@ def plot_seasonal_conditional_metrics(
     n_periods = len(period_names)
     period_colors = _period_colors_with_defaults(period_names, period_colors)
 
+    _whis = list(spread_qpair(spread))
     n_seasons = len(season_order)
     box_w = 0.7 / n_periods
     # x position for each (season, period) box
@@ -1022,7 +1055,7 @@ def plot_seasonal_conditional_metrics(
                     positions=offsets,
                     widths=box_w * 0.85,
                     patch_artist=True,
-                    whis=[5, 95],
+                    whis=_whis,
                     showfliers=False,
                     medianprops=dict(color="white", linewidth=1.8),
                     boxprops=dict(facecolor=color, alpha=0.85, linewidth=0.6),
@@ -1043,10 +1076,11 @@ def plot_seasonal_conditional_metrics(
                    bbox_to_anchor=(0.5, -0.03))
         suptitle = f"Seasonal-conditional EVT — {title_suffix} — inter-model spread"
         suffix = f"{supply_scenario} {supply_year}".strip()
+        _wl = f"whiskers = {SPREAD_LABEL[spread]}"
         if suffix:
-            suptitle += f"\n(season-specific thresholds · {suffix} · whiskers = 5th/95th pct)"
+            suptitle += f"\n(season-specific thresholds · {suffix} · {_wl})"
         else:
-            suptitle += "\n(season-specific thresholds · whiskers = 5th/95th pct)"
+            suptitle += f"\n(season-specific thresholds · {_wl})"
         fig.suptitle(suptitle, fontsize=13)
         plt.tight_layout()
         plt.show()
@@ -1157,20 +1191,46 @@ _ZONE_SHORT: dict = {
 }
 
 
+def _cooccurrence_sign_agreement(df_coo, zones_str, baseline_period, period_name):
+    """Per-(zone_a, zone_b) count of models agreeing on the sign of the change
+    in co-occurrence between ``baseline_period`` and ``period_name``."""
+    agree = np.full((len(zones_str), len(zones_str)), np.nan)
+    for i, za in enumerate(zones_str):
+        for j, zb in enumerate(zones_str):
+            ref = (df_coo[(df_coo["zone_a"] == za) & (df_coo["zone_b"] == zb)
+                          & (df_coo["period"] == baseline_period)]
+                   .set_index("model")["co_occurrence_pct"])
+            cmp = (df_coo[(df_coo["zone_a"] == za) & (df_coo["zone_b"] == zb)
+                          & (df_coo["period"] == period_name)]
+                   .set_index("model")["co_occurrence_pct"])
+            common = ref.index.intersection(cmp.index)
+            d = (cmp.loc[common] - ref.loc[common]).dropna()
+            if len(d) == 0:
+                continue
+            agree[i, j] = float(max(int((d > 0).sum()), int((d < 0).sum())))
+    return agree
+
+
 def _render_cooccurrence_heatmaps(
     df_coo, zones_str, labels, period_names, baseline_period,
-    cmap_abs, cmap_diff, figsize_per_panel, suffix, season_tag,
+    cmap_abs, cmap_diff, figsize_per_panel, suffix, season_tag, window_h=72,
+    stipple_agreement=False, robust_n=7, spread="iqr",
 ):
     """Core heatmap renderer for a single season slice (or full period)."""
+    _qlo, _qhi = spread_qpair(spread)
+
+    def _mat(sub, agg):
+        return (sub.groupby(["zone_a", "zone_b"])["co_occurrence_pct"].agg(agg)
+                .unstack().reindex(index=zones_str, columns=zones_str))
+
     median_mats: dict = {}
+    lo_mats: dict = {}
+    hi_mats: dict = {}
     for period_name in period_names:
         sub = df_coo[df_coo["period"] == period_name]
-        median_mats[period_name] = (
-            sub.groupby(["zone_a", "zone_b"])["co_occurrence_pct"]
-            .median()
-            .unstack()
-            .reindex(index=zones_str, columns=zones_str)
-        )
+        median_mats[period_name] = _mat(sub, "median")
+        lo_mats[period_name] = _mat(sub, lambda s: np.nanpercentile(s, _qlo))
+        hi_mats[period_name] = _mat(sub, lambda s: np.nanpercentile(s, _qhi))
 
     w, h = figsize_per_panel
     n_periods = len(period_names)
@@ -1178,18 +1238,27 @@ def _render_cooccurrence_heatmaps(
     if n_periods == 1:
         axes = [axes]
     for ax, period_name in zip(axes, period_names):
+        med, lo, hi = median_mats[period_name], lo_mats[period_name], hi_mats[period_name]
+        annot = med.copy().astype(object)
+        for r in annot.index:
+            for c in annot.columns:
+                m = med.loc[r, c]
+                annot.loc[r, c] = (
+                    f"{m:.0f}\n[{lo.loc[r, c]:.0f}–{hi.loc[r, c]:.0f}]"
+                    if np.isfinite(m) else ""
+                )
         sns.heatmap(
-            median_mats[period_name], ax=ax, vmin=0, vmax=100, cmap=cmap_abs,
-            annot=True, fmt=".0f", linewidths=0.5,
+            med, ax=ax, vmin=0, vmax=100, cmap=cmap_abs,
+            annot=annot, fmt="", annot_kws={"size": 6}, linewidths=0.5,
             xticklabels=labels, yticklabels=labels,
             cbar=(ax == axes[-1]),
         )
         ax.set_title(period_name, fontsize=12, pad=8)
-        ax.set_xlabel("Zone B (has event within ±72 h)", fontsize=9)
+        ax.set_xlabel(f"Zone B (has event within ±{window_h} h)", fontsize=9)
         ax.set_ylabel("Zone A (event origin)" if ax == axes[0] else "", fontsize=9)
 
-    title1 = f"Compound event co-occurrence (%) — ensemble median{season_tag}"
-    title1 += "\nFraction of Zone A exceedances co-occurring with Zone B exceedance within ±72 h"
+    title1 = f"Compound event co-occurrence (%) — ensemble median [{SPREAD_LABEL[spread]}]{season_tag}"
+    title1 += f"\nFraction of Zone A exceedances co-occurring with Zone B exceedance within ±{window_h} h"
     if suffix:
         title1 += f"\n({suffix})"
     fig.suptitle(title1, fontsize=12, y=1.04)
@@ -1218,6 +1287,16 @@ def _render_cooccurrence_heatmaps(
             xticklabels=labels, yticklabels=labels,
             cbar=(ax == axes[-1]),
         )
+        if stipple_agreement:
+            agree = _cooccurrence_sign_agreement(
+                df_coo, zones_str, baseline_period, period_name
+            )
+            for i in range(len(zones_str)):
+                for j in range(len(zones_str)):
+                    n_agree = agree[i, j]
+                    if not np.isfinite(n_agree) or n_agree < robust_n:
+                        ax.plot(j + 0.5, i + 0.5, "x", color="black",
+                                markersize=7, markeredgewidth=1.8, zorder=5)
         ax.set_title(f"{period_name} − {baseline_period}", fontsize=12, pad=8)
         ax.set_xlabel("Zone B", fontsize=9)
         ax.set_ylabel("Zone A (event origin)" if ax == axes[0] else "", fontsize=9)
@@ -1226,6 +1305,9 @@ def _render_cooccurrence_heatmaps(
         f"Change in compound co-occurrence (pp) vs {baseline_period} — ensemble median{season_tag}"
         "\nPositive = more frequent co-occurrence at higher warming"
     )
+    if stipple_agreement:
+        n_models = int(df_coo["model"].nunique())
+        title2 += f" · × = <{robust_n}/{n_models} models agree on sign"
     if suffix:
         title2 += f" · ({suffix})"
     fig.suptitle(title2, fontsize=12, y=1.04)
@@ -1245,6 +1327,11 @@ def plot_zone_cooccurrence_heatmaps(
     season_order: list | None = None,
     supply_scenario: str = "",
     supply_year="",
+    window_steps: int = 24,
+    time_step_h: float = 3.0,
+    stipple_agreement: bool = False,
+    robust_n: int = 7,
+    spread: str = "iqr",
 ) -> None:
     """Heatmap figures for ensemble-median co-occurrence and change vs baseline.
 
@@ -1275,6 +1362,21 @@ def plot_zone_cooccurrence_heatmaps(
         If ``None``, seasons are taken in the order they appear in the data.
     supply_scenario, supply_year :
         Injected into figure titles.
+    window_steps :
+        Half-width of the co-occurrence dilation window in time steps, matching
+        the ``window_steps`` passed to ``compute_zone_pair_cooccurrence``
+        (default 24). Used only to label the window in the title / axis.
+    time_step_h :
+        Hours per time step (default 3), so the window is reported as
+        ``±(window_steps * time_step_h)`` hours.
+    stipple_agreement :
+        When True, the *difference* (change-vs-baseline) panels are stippled
+        with an ``×`` on cells where fewer than ``robust_n`` models agree on the
+        sign of the change — i.e. the direction of the co-occurrence change is
+        not robust across the ensemble.
+    robust_n :
+        Minimum number of models that must agree on the sign of the change for a
+        cell to be considered robust (default 7 of 9).
     """
     period_names = list(period_defs.keys())
     if baseline_period is None:
@@ -1284,6 +1386,7 @@ def plot_zone_cooccurrence_heatmaps(
     labels = [zs.get(str(z), str(z)) for z in zones]
     zones_str = [str(z) for z in zones]
     suffix = f"{supply_scenario} {supply_year}".strip()
+    window_h = int(round(window_steps * time_step_h))
 
     if "season" in df_coo.columns:
         seasons = season_order or list(df_coo["season"].unique())
@@ -1292,12 +1395,15 @@ def plot_zone_cooccurrence_heatmaps(
                 df_coo[df_coo["season"] == season],
                 zones_str, labels, period_names, baseline_period,
                 cmap_abs, cmap_diff, figsize_per_panel, suffix,
-                season_tag=f" — {season}",
+                season_tag=f" — {season}", window_h=window_h,
+                stipple_agreement=stipple_agreement, robust_n=robust_n, spread=spread,
             )
     else:
         _render_cooccurrence_heatmaps(
             df_coo, zones_str, labels, period_names, baseline_period,
             cmap_abs, cmap_diff, figsize_per_panel, suffix, season_tag="",
+            window_h=window_h,
+            stipple_agreement=stipple_agreement, robust_n=robust_n, spread=spread,
         )
 
 
@@ -2128,6 +2234,7 @@ def plot_event_diurnal_profile(
     figsize_seasonal: tuple = (14, 9),
     figsize_pv: tuple = (14, 8),
     path_savefig: "Path | str | None" = None,
+    spread: str = "iqr",
 ) -> None:
     """Diurnal distribution of extreme-event timesteps and PV generation context.
 
@@ -2176,6 +2283,7 @@ def plot_event_diurnal_profile(
 
     period_order = list(period_defs.keys()) if period_defs is not None else sorted(df_diurnal["period"].unique())
     zone_strs    = [str(z) for z in zones]
+    _qlo, _qhi = (q / 100.0 for q in spread_qpair(spread))  # spread band fractions
 
     # ── Default palettes ──────────────────────────────────────────────────────
     if zone_colors is None:
@@ -2211,7 +2319,7 @@ def plot_event_diurnal_profile(
     )
     fig1.suptitle(
         f"Diurnal distribution of extreme events{subtitle}\n"
-        f"(% of event timesteps per hour; ensemble median ± IQR across models × periods)",
+        f"(% of event timesteps per hour; ensemble median ± {SPREAD_LABEL[spread]} across models × periods)",
         fontsize=11, fontweight="bold", y=1.01,
     )
 
@@ -2219,7 +2327,7 @@ def plot_event_diurnal_profile(
     # Set after plotting so the shared axis encompasses the full data range.
     _pct_ymax = (
         df_diurnal.groupby(["season", "zone", "hour"])["pct_event_steps"]
-        .quantile(0.75)
+        .quantile(_qhi)
         .max()
     )
 
@@ -2233,8 +2341,8 @@ def plot_event_diurnal_profile(
 
             grp = df_sz.groupby("hour")["pct_event_steps"]
             med = grp.median().reindex(hours_sorted)
-            q25 = grp.quantile(0.25).reindex(hours_sorted)
-            q75 = grp.quantile(0.75).reindex(hours_sorted)
+            q25 = grp.quantile(_qlo).reindex(hours_sorted)
+            q75 = grp.quantile(_qhi).reindex(hours_sorted)
 
             col = zone_colors.get(zone_str, "gray")
             ax.plot(hours_sorted, med.values, color=col, lw=1.8,
@@ -2280,7 +2388,7 @@ def plot_event_diurnal_profile(
         # same scale.  Bar axis uses the max q75 of pct_event_steps; PV axis uses
         # the global max of both the event and total median PV profiles.
         _pct_s_ymax = (
-            df_s.groupby(["zone", "hour"])["pct_event_steps"].quantile(0.75).max()
+            df_s.groupby(["zone", "hour"])["pct_event_steps"].quantile(_qhi).max()
         )
         _pv_s_ymax = max(
             df_s.groupby(["zone", "hour"])["mean_pv_event"].median().max(),
@@ -2308,8 +2416,8 @@ def plot_event_diurnal_profile(
             pct_med     = grp["pct_event_steps"].median().reindex(hours_sorted)
             pv_ev_med   = grp["mean_pv_event"].median().reindex(hours_sorted)
             pv_clim_med = grp["mean_pv_clim"].median().reindex(hours_sorted)
-            pv_ev_q25   = grp["mean_pv_event"].quantile(0.25).reindex(hours_sorted)
-            pv_ev_q75   = grp["mean_pv_event"].quantile(0.75).reindex(hours_sorted)
+            pv_ev_q25   = grp["mean_pv_event"].quantile(_qlo).reindex(hours_sorted)
+            pv_ev_q75   = grp["mean_pv_event"].quantile(_qhi).reindex(hours_sorted)
 
             # Fill NaN in PV-during-events (hours with no events) with the
             # climatological value, then interpolate any remaining gaps.

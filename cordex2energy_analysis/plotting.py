@@ -2528,7 +2528,6 @@ def plot_nodes_choropleth(
     -------
     matplotlib.axes.Axes
     """
-    import matplotlib.cm as mcm
     import matplotlib.colors as mcolors_local
     import pandas as pd
 
@@ -2564,7 +2563,7 @@ def plot_nodes_choropleth(
     v_min = vmin if vmin is not None else float(np.nanmin(node_values))
     v_max = vmax if vmax is not None else float(np.nanmax(node_values))
     norm = mcolors_local.Normalize(vmin=v_min, vmax=v_max)
-    cmap_obj = mcm.get_cmap(cmap)
+    cmap_obj = plt.get_cmap(cmap)
 
     # --- projection / axes --------------------------------------------------
     if projection is None:

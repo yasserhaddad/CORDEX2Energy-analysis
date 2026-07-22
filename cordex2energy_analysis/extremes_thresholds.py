@@ -133,7 +133,7 @@ def find_evt_pot_threshold(
 
 
 def compute_evt_thresholds_for_all_zones(
-    ds_reference, p_value_threshold=0.05, country_dim="zone"
+    ds_reference, min_p=0.9, p_value_threshold=0.05, country_dim="zone"
 ) -> "tuple[xr.DataArray, xr.DataArray]":
     """Vectorized wrapper to run the EVT threshold identification across all zones.
 
@@ -141,11 +141,14 @@ def compute_evt_thresholds_for_all_zones(
     -------
     da_thresholds :
         EVT threshold in GW for each zone.
+    min_p :
+        Minimum percentile of positive RL values to consider as a candidate.
     da_percentiles :
-        Empirical percentile (0–100) of the threshold within all 3-hourly RL
-        values of the reference period (including negative values).  This makes
-        the threshold directly comparable across zones regardless of the
-        fraction of negative-RL hours each zone has.
+        Empirical percentile (0–100) of the threshold within the finite
+        (non-NaN) values of the reference period.  NaN entries (e.g. from a
+        prior ``.where()`` filter) are stripped before both threshold finding
+        and percentile computation, so the percentile is always relative to
+        the domain on which the threshold was actually calibrated.
     """
     threshold_dict: dict = {}
     percentile_dict: dict = {}
@@ -153,9 +156,11 @@ def compute_evt_thresholds_for_all_zones(
     for zone in ds_reference[country_dim].values:
         zone_series = ds_reference.sel({country_dim: zone}).values.flatten()
 
-        u_robust = find_evt_pot_threshold(zone_series, p_value_threshold=p_value_threshold)
+        valid_mask = np.isfinite(zone_series)
+        zone_series = zone_series[valid_mask]
+
+        u_robust = find_evt_pot_threshold(zone_series, min_p=min_p, p_value_threshold=p_value_threshold)
         threshold_dict[zone] = u_robust
-        # Percentile of the threshold in the full (signed) RL distribution
         percentile_dict[zone] = float(np.mean(zone_series <= u_robust) * 100)
 
     _zones = list(threshold_dict.keys())
@@ -575,8 +580,10 @@ def compute_tails_thresholds_for_all_zones(
     da_thresholds :
         TAILS threshold value (in Z-normalised units) for each zone.
     da_threshold_pct :
-        Empirical percentile (0–100) of the threshold within the zone's
-        Z-normalised series.
+        Empirical percentile (0–100) of the threshold within the finite
+        (non-NaN) values of the zone's Z-normalised series.  NaN entries
+        are stripped before both threshold finding and percentile computation,
+        matching the convention of ``compute_evt_thresholds_for_all_zones``.
     da_threshold_range :
         (zone, bound) DataArray with the lower/upper edge of the
         indistinguishable threshold range T* (eq. 9).  NaN on fallback.
@@ -601,6 +608,10 @@ def compute_tails_thresholds_for_all_zones(
                 zone_years.reshape(da_zone[time_dim].size, *([1] * (da_zone.ndim - 1))),
                 da_zone.shape,
             ).flatten()
+
+        valid_mask = np.isfinite(zone_series)
+        zone_series = zone_series[valid_mask]
+        zone_years = zone_years[valid_mask]
 
         result = find_tails_threshold(
             zone_series,
@@ -663,6 +674,180 @@ def compute_tails_thresholds_for_all_zones(
 
 
 # ---------------------------------------------------------------------------
+# Deficit floor + coverage gate (degenerate-threshold handling)
+# ---------------------------------------------------------------------------
+
+# Minimum fraction of reference-period hours that must be in genuine deficit
+# (residual load > 0) for an "extreme deficit" regime to be considered to exist.
+# Sized from the CERRA reference distribution: surplus-dominated zones (e.g.
+# Nordic, ~2.5 % positive hours) fall far below this, while every deficit-prone
+# zone sits at >=31 % even seasonally — so 5 % cleanly separates the two.
+DEFAULT_MIN_POSITIVE_FRACTION = 0.05
+
+
+def _apply_deficit_floor(
+    threshold_gwh: float,
+    rl_values: np.ndarray,
+    min_positive_fraction: float = DEFAULT_MIN_POSITIVE_FRACTION,
+) -> "tuple[float, bool, float]":
+    """Floor an extreme-event threshold at genuine deficit (RL > 0) and flag degeneracy.
+
+    An "extreme energy event" must at minimum be a real supply deficit (demand
+    exceeds all in-zone generation + storage). For deficit-prone zones the tail
+    threshold is already well above 0, so the floor is a no-op. For
+    surplus-dominated zones (e.g. hydro-rich Nordic) the unconstrained tail can
+    land at or below 0 GWh — a physically empty "extreme" — which this floor
+    removes.
+
+    Parameters
+    ----------
+    threshold_gwh :
+        Candidate threshold in GWh (original residual-load units).
+    rl_values :
+        1-D reference-period residual-load values for the zone (or zone-season),
+        in the same units, used to measure the positive (deficit) fraction.
+    min_positive_fraction :
+        Minimum fraction of hours in deficit for a non-degenerate regime.
+
+    Returns
+    -------
+    floored_threshold :
+        ``max(threshold_gwh, 0.0)``.
+    is_degenerate :
+        True when the zone has too few deficit hours (positive fraction below
+        ``min_positive_fraction``) or the raw threshold was already <= 0.
+    positive_fraction :
+        Fraction of finite values with RL > 0.
+    """
+    finite = rl_values[np.isfinite(rl_values)]
+    positive_fraction = float(np.mean(finite > 0)) if finite.size else 0.0
+    floored = max(float(threshold_gwh), 0.0)
+    is_degenerate = (
+        positive_fraction < min_positive_fraction or float(threshold_gwh) <= 0.0
+    )
+    return floored, is_degenerate, positive_fraction
+
+
+def diagnose_threshold_coverage(
+    da_rl: xr.DataArray,
+    thresholds=None,
+    zone_dim: str = "zone",
+    season_map: "dict[int, str] | None" = None,
+    season_order: "list[str] | None" = None,
+    min_positive_fraction: float = DEFAULT_MIN_POSITIVE_FRACTION,
+) -> pd.DataFrame:
+    """Report deficit coverage and threshold degeneracy per zone (and season).
+
+    Use this as a notebook diagnostic to see which zones have a genuine extreme
+    deficit regime. A zone whose ``positive_fraction`` falls below
+    ``min_positive_fraction`` has essentially no deficit tail; its TAILS/EVT
+    threshold is degenerate (near or below 0 GWh) and it should be excluded from
+    cross-zone tail comparisons.
+
+    Parameters
+    ----------
+    da_rl :
+        Reference-period residual load with a ``zone_dim`` (and ``time``) dim.
+    thresholds :
+        Optional thresholds to annotate. Either a zone-indexed ``xr.DataArray``
+        (annual) or a ``{zone: {season: float}}`` mapping (seasonal). When given
+        with ``season_map``, the seasonal mapping is reported per season.
+    zone_dim, season_map, season_order, min_positive_fraction :
+        See module/usage notes.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per zone (or zone-season) with positive_fraction, threshold_gwh,
+        floored threshold, and the ``degenerate`` flag.
+    """
+    rows = []
+    zones = list(da_rl[zone_dim].values)
+    times = pd.DatetimeIndex(da_rl["time"].values) if "time" in da_rl.dims else None
+
+    for z in zones:
+        zk = str(z)
+        x_all = da_rl.sel({zone_dim: z}).values.flatten()
+        if season_map is None:
+            thr = float("nan")
+            if isinstance(thresholds, xr.DataArray):
+                thr = float(thresholds.sel({zone_dim: z}).values)
+            floored, degenerate, pos = _apply_deficit_floor(
+                thr if np.isfinite(thr) else 0.0, x_all, min_positive_fraction
+            )
+            rows.append({
+                "zone": zk, "season": "ALL",
+                "positive_fraction": pos,
+                "threshold_gwh": thr,
+                "threshold_floored_gwh": floored if np.isfinite(thr) else float("nan"),
+                "degenerate": degenerate,
+            })
+        else:
+            _seasons = season_order or sorted(set(season_map.values()))
+            seas = np.array([season_map[m] for m in times.month])
+            for s in _seasons:
+                m = seas == s
+                x_s = x_all[m]
+                thr = float("nan")
+                if isinstance(thresholds, dict):
+                    thr = float(thresholds.get(zk, {}).get(s, float("nan")))
+                floored, degenerate, pos = _apply_deficit_floor(
+                    thr if np.isfinite(thr) else 0.0, x_s, min_positive_fraction
+                )
+                rows.append({
+                    "zone": zk, "season": s,
+                    "positive_fraction": pos,
+                    "threshold_gwh": thr,
+                    "threshold_floored_gwh": floored if np.isfinite(thr) else float("nan"),
+                    "degenerate": degenerate,
+                })
+
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Fixed-percentile threshold selection
+# ---------------------------------------------------------------------------
+
+# Default percentile (0-100) of the positive residual-load distribution used by
+# the ``"PERCENTILE"`` method. The 95th percentile of positive RL is a simple,
+# transparent tail cut-off with no distributional-fit assumptions.
+DEFAULT_FIXED_PERCENTILE = 95.0
+
+
+def find_fixed_percentile_threshold(
+    zone_data,
+    percentile: float = DEFAULT_FIXED_PERCENTILE,
+) -> float:
+    """Fixed-percentile threshold of the positive residual-load distribution.
+
+    A model-free alternative to the EVT/TAILS tail-selection engines: the
+    threshold is simply the ``percentile``-th percentile of the strictly
+    positive (deficit) residual-load values. Non-positive and non-finite values
+    are dropped first so the percentile is always taken over the genuine
+    deficit tail, matching the deficit-floor convention used elsewhere.
+
+    Parameters
+    ----------
+    zone_data :
+        1-D (or flattenable) array of residual loads for the reference period.
+    percentile :
+        Percentile in [0, 100] of the positive-RL distribution (default 95).
+
+    Returns
+    -------
+    float
+        Threshold in the original (GWh) units, or NaN if there are no positive
+        values to compute a percentile from.
+    """
+    x = np.asarray(zone_data, dtype=float).ravel()
+    positive_rl = x[np.isfinite(x) & (x > 0)]
+    if positive_rl.size == 0:
+        return float("nan")
+    return float(np.percentile(positive_rl, percentile))
+
+
+# ---------------------------------------------------------------------------
 # Unified threshold calibration (method-agnostic wrappers)
 # ---------------------------------------------------------------------------
 
@@ -672,46 +857,102 @@ def compute_active_threshold(
     method: str,
     zone_dim: str = "zone",
     p_value_threshold: float = 0.1,
+    percentile: float = DEFAULT_FIXED_PERCENTILE,
+    min_positive_fraction: float = DEFAULT_MIN_POSITIVE_FRACTION,
 ) -> xr.DataArray:
     """Compute the extreme-event threshold for all zones using the chosen method.
+
+    Thresholds are floored at genuine deficit (RL > 0): an extreme energy event
+    must at minimum be a real supply deficit. This is a no-op for deficit-prone
+    zones (tail already well above 0) and removes the degenerate near-/sub-zero
+    "extreme" of surplus-dominated zones (e.g. hydro-rich Nordic). Zones with a
+    deficit fraction below ``min_positive_fraction`` are flagged as degenerate
+    via ``result.attrs`` (and a warning) so callers can exclude them from
+    cross-zone tail comparisons. See :func:`diagnose_threshold_coverage`.
 
     Parameters
     ----------
     da_rl :
         Reference-period residual load DataArray with a ``zone_dim`` dimension.
     method :
-        ``"EVT"`` for Peaks-Over-Threshold / GPD stability test, or
-        ``"TAILS"`` for TAILS automated distance minimisation.
+        ``"EVT"`` for Peaks-Over-Threshold / GPD stability test,
+        ``"TAILS"`` for TAILS automated distance minimisation, or
+        ``"PERCENTILE"`` for a fixed percentile of the positive-RL distribution.
     zone_dim :
         Name of the zone dimension (default ``"zone"``).
     p_value_threshold :
         Passed to :func:`find_evt_pot_threshold` when ``method="EVT"``.
+    percentile :
+        Percentile (0-100) of the positive-RL distribution used when
+        ``method="PERCENTILE"`` (default 95).
+    min_positive_fraction :
+        Minimum fraction of reference-period hours in deficit (RL > 0) for a
+        non-degenerate extreme regime (default 5 %).
 
     Returns
     -------
     xr.DataArray
-        Zone-indexed DataArray of thresholds in the original (GWh) units of ``da_rl``.
+        Zone-indexed DataArray of thresholds in the original (GWh) units of
+        ``da_rl``. ``.attrs['degenerate_zones']`` lists flagged zones and
+        ``.attrs['positive_fraction']`` maps zone -> deficit fraction.
     """
     if method == "EVT":
         da_thr, _ = compute_evt_thresholds_for_all_zones(
             da_rl, p_value_threshold=p_value_threshold, country_dim=zone_dim
         )
-        return da_thr
+        raw = {str(z): float(da_thr.sel({zone_dim: z}).values) for z in da_rl[zone_dim].values}
     elif method == "TAILS":
         _, da_pct, _, _ = compute_tails_thresholds_for_all_zones(
             da_rl, zone_dim=zone_dim, threshold_type="yearly"
         )
-        return xr.DataArray(
-            [float(np.percentile(
+        raw = {
+            str(z): float(np.nanpercentile(
                 da_rl.sel({zone_dim: z}).values.flatten(),
                 float(da_pct.sel({zone_dim: z}).values),
-            )) for z in da_rl[zone_dim].values],
-            coords={zone_dim: da_rl[zone_dim].values},
-            dims=[zone_dim],
-            name="threshold_gwh",
-        )
+            ))
+            for z in da_rl[zone_dim].values
+        }
+    elif method == "PERCENTILE":
+        raw = {
+            str(z): find_fixed_percentile_threshold(
+                da_rl.sel({zone_dim: z}).values.flatten(), percentile
+            )
+            for z in da_rl[zone_dim].values
+        }
     else:
-        raise ValueError(f"Unknown method {method!r}. Use 'EVT' or 'TAILS'.")
+        raise ValueError(
+            f"Unknown method {method!r}. Use 'EVT', 'TAILS' or 'PERCENTILE'."
+        )
+
+    # Deficit floor + coverage gate (applies to both methods).
+    floored, degenerate_zones, positive_fraction = {}, [], {}
+    for z in da_rl[zone_dim].values:
+        zk = str(z)
+        thr_f, is_deg, pos = _apply_deficit_floor(
+            raw[zk], da_rl.sel({zone_dim: z}).values.flatten(), min_positive_fraction
+        )
+        floored[zk] = thr_f
+        positive_fraction[zk] = pos
+        if is_deg:
+            degenerate_zones.append(zk)
+            warnings.warn(
+                f"[{method}] Zone {zk!r} has a degenerate extreme threshold "
+                f"(raw={raw[zk]:.1f} GWh, deficit fraction={pos:.1%} "
+                f"< {min_positive_fraction:.0%}); floored to {thr_f:.1f} GWh. "
+                f"Exclude from cross-zone tail comparisons.",
+                stacklevel=2,
+            )
+
+    da_out = xr.DataArray(
+        [floored[str(z)] for z in da_rl[zone_dim].values],
+        coords={zone_dim: da_rl[zone_dim].values},
+        dims=[zone_dim],
+        name="threshold_gwh",
+    )
+    da_out.attrs["degenerate_zones"] = degenerate_zones
+    da_out.attrs["positive_fraction"] = positive_fraction
+    da_out.attrs["min_positive_fraction"] = min_positive_fraction
+    return da_out
 
 
 def calibrate_seasonal_active_thresholds(
@@ -721,8 +962,16 @@ def calibrate_seasonal_active_thresholds(
     season_months: "dict[str, list[int]]",
     method: str,
     zone_dim: str = "zone",
+    percentile: float = DEFAULT_FIXED_PERCENTILE,
+    min_positive_fraction: float = DEFAULT_MIN_POSITIVE_FRACTION,
 ) -> "tuple[dict, dict]":
     """Calibrate per-season thresholds for all zones using the chosen method.
+
+    As in :func:`compute_active_threshold`, each (zone, season) threshold is
+    floored at genuine deficit (RL > 0) — a no-op for deficit-prone
+    zone-seasons and a correction for surplus-dominated ones (e.g. Nordic JJA,
+    whose unconstrained TAILS threshold is negative). Degenerate zone-seasons
+    (deficit fraction < ``min_positive_fraction``) emit a warning.
 
     Parameters
     ----------
@@ -735,14 +984,20 @@ def calibrate_seasonal_active_thresholds(
     season_months :
         Mapping ``{season: [month_ints]}``.
     method :
-        ``"EVT"`` or ``"TAILS"``.
+        ``"EVT"``, ``"TAILS"`` or ``"PERCENTILE"``.
     zone_dim :
         Name of the zone dimension (default ``"zone"``).
+    percentile :
+        Percentile (0-100) of the season's positive-RL distribution used when
+        ``method="PERCENTILE"`` (default 95).
+    min_positive_fraction :
+        Minimum deficit fraction for a non-degenerate seasonal regime (default 5 %).
 
     Returns
     -------
     thresholds :
-        ``{zone: {season: float}}`` — threshold in GWh for each (zone, season).
+        ``{zone: {season: float}}`` — threshold in GWh for each (zone, season),
+        floored at 0.
     percentiles :
         ``{zone: {season: float}}`` — empirical percentile (0–100) of each threshold
         within the season's own reference-period RL distribution.
@@ -764,23 +1019,45 @@ def calibrate_seasonal_active_thresholds(
             season_rl    = rl_zone[mask]
             season_years = years_ref[mask]
 
+            # Strip NaN (e.g. from a prior .where() filter applied by the caller)
+            # for threshold finding and percentile computation.  The full season_rl
+            # is kept for _apply_deficit_floor so positive_fraction is correct.
+            valid        = np.isfinite(season_rl)
+            season_rl_v  = season_rl[valid]
+            season_yrs_v = season_years[valid]
+
             if method == "EVT":
-                thr = find_evt_pot_threshold(season_rl)
-                pct = float(np.mean(season_rl <= thr) * 100)
+                thr = find_evt_pot_threshold(season_rl_v)
+                pct = float(np.mean(season_rl_v <= thr) * 100)
+            elif method == "PERCENTILE":
+                thr = find_fixed_percentile_threshold(season_rl_v, percentile)
+                pct = (
+                    float(np.mean(season_rl_v <= thr) * 100)
+                    if np.isfinite(thr) else float("nan")
+                )
             else:  # TAILS
                 result = find_tails_threshold(
-                    season_rl,
-                    years=season_years,
+                    season_rl_v,
+                    years=season_yrs_v,
                     threshold_type="yearly",
                     random_seed=0,
                 )
-                # Back-transform: map the TAILS Z-threshold back to original units
-                # via the empirical percentile rank in the Z-normalised series.
-                z_season = _z_normalize(season_rl.astype(float), season_years, "yearly")
+                z_season = _z_normalize(season_rl_v.astype(float), season_yrs_v, "yearly")
                 pct = float(np.nanmean(z_season <= result.threshold) * 100)
-                thr = float(np.percentile(season_rl, pct))
+                thr = float(np.nanpercentile(season_rl_v, pct))
 
-            thresholds[zk][season] = thr
+            # Deficit floor + coverage gate (uses full season_rl for positive_fraction).
+            thr_f, is_deg, pos = _apply_deficit_floor(thr, season_rl, min_positive_fraction)
+            if is_deg:
+                warnings.warn(
+                    f"[{method}] Zone {zk!r} season {season!r} has a degenerate "
+                    f"extreme threshold (raw={thr:.1f} GWh, deficit fraction="
+                    f"{pos:.1%} < {min_positive_fraction:.0%}); floored to "
+                    f"{thr_f:.1f} GWh. Exclude from cross-zone tail comparisons.",
+                    stacklevel=2,
+                )
+
+            thresholds[zk][season] = thr_f
             percentiles[zk][season] = pct
 
     return thresholds, percentiles

@@ -421,6 +421,115 @@ def compute_zone_pair_cooccurrence(
     return pd.DataFrame(records)
 
 
+def compute_zone_pair_cooccurrence_by_duration(
+    cache_rl: dict,
+    evt_thresholds: dict,
+    period_defs: dict,
+    models,
+    zones,
+    window_steps: int = 24,
+    method: str = "spa",
+    duration_bins: dict | None = None,
+    zone_dim: str = "zone",
+) -> pd.DataFrame:
+    """Zone-pair co-occurrence conditioned on event duration class (gap G2).
+
+    Like :func:`compute_zone_pair_cooccurrence`, but instead of dilating *all*
+    exceedance timesteps, events are first detected per zone and partitioned
+    into duration classes; co-occurrence is then computed *within* each class.
+    This tests whether long, synoptic ``multi_day`` events are more spatially
+    coherent across zones (blocking is large-scale) than short ``sub_daily``
+    events (more zone-specific) — the systemic-risk question behind the
+    importance of cross-border balancing.
+
+    For each (model, period, duration_class, zone_a, zone_b) the fraction of
+    Zone A *class-member* timesteps that fall within ±``window_steps`` steps of a
+    Zone B *class-member* timestep is reported, together with ``n_a`` (the count
+    of Zone A class-member timesteps) so sparse cells can be masked downstream.
+
+    Parameters
+    ----------
+    cache_rl :
+        ``{model: ds_rl}`` — post-battery residual load datasets.
+    evt_thresholds :
+        Annual ``{model: xr.DataArray}`` thresholds (one per zone).
+    period_defs :
+        Fixed or per-model period definitions.
+    models, zones :
+        Model chain IDs and zone coordinate values.
+    window_steps :
+        Half-width of the dilation kernel in time steps (default 24 = ±72 h),
+        matching :func:`compute_zone_pair_cooccurrence`. ±72 h comfortably spans
+        the synoptic timescale of blocking, so a multi_day event in one zone and
+        a multi_day event in another are counted as co-occurring when their
+        active windows overlap within three days.
+    method :
+        Event-detection algorithm — ``"spa"`` (default) or ``"run_length"``.
+    duration_bins :
+        Ordered ``{label: (lo_exclusive, hi_inclusive)}`` hour bounds. Defaults
+        to ``DEFAULT_DURATION_BINS``; pass ``{"sub_daily": (0, 24),
+        "multi_day": (24, inf)}`` for the two-regime split.
+    zone_dim :
+        Name of the zone dimension (default ``"zone"``).
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: model, period, duration_class, zone_a, zone_b,
+        co_occurrence_pct, n_a.
+    """
+    from cordex2energy_analysis.plotting_extremes import resolve_model_periods
+
+    bins = duration_bins or DEFAULT_DURATION_BINS
+    dilation_struct = np.ones(2 * window_steps + 1, dtype=bool)
+    records: list[dict] = []
+
+    for model in models:
+        ds_rl_m = cache_rl[model]
+        thr_m = evt_thresholds[model]
+        resolved = {
+            k: v for k, v in resolve_model_periods(period_defs, model).items()
+            if v is not None
+        }
+        for period_name, (t0, t1) in resolved.items():
+            ds_rl_p = ds_rl_m.sel(time=slice(t0, t1))
+            n_steps = ds_rl_p.sizes["time"]
+
+            # Per-duration-class, per-zone timestep masks (True at indices that
+            # belong to an event of that class).
+            dc_masks: dict = {dc: {} for dc in bins}
+            for zone in zones:
+                rl = ds_rl_p["residual_load"].sel({zone_dim: zone}).values
+                thr = float(thr_m.sel({zone_dim: zone}).values)
+                per_dc = {dc: np.zeros(n_steps, dtype=bool) for dc in bins}
+                for ev in detect_events(rl, thr, method=method):
+                    dc = classify_event_duration(ev["duration_h"], bins)
+                    per_dc[dc][ev["indices"]] = True
+                for dc in bins:
+                    dc_masks[dc][str(zone)] = per_dc[dc]
+
+            for dc in bins:
+                exc_masks = dc_masks[dc]
+                dilated = _cooccurrence_on_array(exc_masks, zones, dilation_struct)
+                for za in zones:
+                    za_key = str(za)
+                    n_a = int(exc_masks[za_key].sum())
+                    for zb in zones:
+                        zb_key = str(zb)
+                        frac = (
+                            float((exc_masks[za_key] & dilated[zb_key]).sum()) / n_a * 100
+                            if n_a > 0 else np.nan
+                        )
+                        records.append({
+                            "model": model, "period": period_name,
+                            "duration_class": dc,
+                            "zone_a": za_key, "zone_b": zb_key,
+                            "co_occurrence_pct": frac, "n_a": n_a,
+                        })
+
+    return pd.DataFrame(records)
+
+
 # ---------------------------------------------------------------------------
 # Duration-severity event extraction
 # ---------------------------------------------------------------------------
@@ -592,6 +701,185 @@ def compute_unserved_energy_fraction(
 # ---------------------------------------------------------------------------
 
 
+#: Per-asset metric prefixes that only exist when the battery dispatch is split.
+_SPLIT_ONLY_PREFIXES = ("prosumer_", "utility_")
+
+#: Metric columns emitted by :func:`compute_flexibility_attenuation_metrics`, by kind.
+_FLEX_METRIC_GROUPS = {
+    "deployed": [
+        "battery_deployed_gwh_per_event", "prosumer_deployed_gwh_per_event",
+        "utility_deployed_gwh_per_event", "reservoir_deployed_gwh_per_event",
+    ],
+    "attenuation": [
+        "battery_attenuation_pct", "prosumer_attenuation_pct",
+        "utility_attenuation_pct", "reservoir_attenuation_pct",
+        "combined_attenuation_pct",
+    ],
+    "share": ["battery_attenuation_share_pct", "reservoir_attenuation_share_pct"],
+}
+
+
+def battery_split_mode(ds_comp) -> str:
+    """How battery dispatch is disaggregated in a components dataset.
+
+    Returns one of:
+
+    - ``"split"``   — ``battery_``, ``prosumer_`` and ``utility_dispatch_gwh`` all present
+      (the ``market`` flexibility scheme, both assets dispatched separately).
+    - ``"partial"`` — battery plus exactly one of prosumer/utility.  This is a real
+      state: under ``market`` with ``--utility_dispatch_level zone`` the *country-level*
+      ``components.nc`` holds ``prosumer_dispatch_gwh`` but not ``utility_dispatch_gwh``,
+      because utility is dispatched after zonal aggregation.
+    - ``"lumped"``  — only the combined ``battery_dispatch_gwh`` (the ``system`` scheme,
+      where prosumer and utility are one storage asset).
+    - ``"none"``    — no battery dispatch at all.
+
+    In every mode ``battery_dispatch_gwh`` is the **total** storage dispatch, so the
+    combined battery metrics and the battery/reservoir Shapley shares stay comparable
+    across schemes; only the intra-battery breakdown depends on the mode.
+    """
+    dv = ds_comp.data_vars
+    if "battery_dispatch_gwh" not in dv:
+        return "none"
+    n_split = ("prosumer_dispatch_gwh" in dv) + ("utility_dispatch_gwh" in dv)
+    return {2: "split", 1: "partial", 0: "lumped"}[n_split]
+
+
+def flex_metric_columns(df, kind: str = "attenuation", drop_all_nan: bool = True) -> list:
+    """Flexibility metric columns of *df* that are meaningful for its ``battery_mode``.
+
+    Use this instead of hardcoding metric lists, so a lumped (``system``) run plots the
+    combined battery metrics without empty prosumer/utility panels.
+
+    Parameters
+    ----------
+    df :
+        DataFrame from :func:`compute_flexibility_attenuation_metrics`.
+    kind :
+        ``"deployed"``, ``"attenuation"``, ``"share"``, or ``"all"``.
+    drop_all_nan :
+        Also drop columns that are present but entirely NaN.  This is what removes the
+        per-asset entries under ``lumped`` (and the missing one under ``partial``).
+
+    Returns
+    -------
+    list of str
+        Column names, in canonical order, that exist in *df* and carry data.
+    """
+    if kind == "all":
+        candidates = [c for g in _FLEX_METRIC_GROUPS.values() for c in g]
+    elif kind in _FLEX_METRIC_GROUPS:
+        candidates = list(_FLEX_METRIC_GROUPS[kind])
+    else:
+        raise ValueError(
+            f"Unknown kind {kind!r}; expected one of "
+            f"{tuple(_FLEX_METRIC_GROUPS) + ('all',)}."
+        )
+
+    mode = None
+    if "battery_mode" in df.columns:
+        modes = df["battery_mode"].dropna().unique()
+        mode = modes[0] if len(modes) == 1 else None  # mixed -> fall back to data checks
+
+    cols = []
+    for c in candidates:
+        if c not in df.columns:
+            continue
+        if mode == "lumped" and c.startswith(_SPLIT_ONLY_PREFIXES):
+            continue
+        if drop_all_nan and df[c].isna().all():
+            continue
+        cols.append(c)
+    return cols
+
+
+def _flex_event_metrics(
+    events, rl, thr, bat_disp, pro_disp, util_disp, res_disp,
+    has_prosumer, has_utility, has_battery, has_reservoir, time_step_h=3.0,
+) -> dict:
+    """Aggregate per-event flexibility deployed / attenuation metrics for a list
+    of events (NaNs when empty).  Shared by the pooled and duration-stratified
+    paths of :func:`compute_flexibility_attenuation_metrics`."""
+    _nan = float("nan")
+    if not events:
+        return {
+            "n_events": 0,
+            "battery_deployed_gwh_per_event": _nan, "prosumer_deployed_gwh_per_event": _nan,
+            "utility_deployed_gwh_per_event": _nan, "reservoir_deployed_gwh_per_event": _nan,
+            "battery_attenuation_pct": _nan, "prosumer_attenuation_pct": _nan,
+            "utility_attenuation_pct": _nan, "reservoir_attenuation_pct": _nan,
+            "combined_attenuation_pct": _nan,
+            "battery_attenuation_share_pct": _nan, "reservoir_attenuation_share_pct": _nan,
+        }
+    bat_dep, pro_dep, util_dep, res_dep = [], [], [], []
+    bat_att, pro_att, util_att, res_att, comb_att = [], [], [], [], []
+    bat_share, res_share = [], []
+    for ev in events:
+        ev_idx = ev["indices"]
+        sev_actual = float(np.maximum(rl[ev_idx] - thr, 0.0).sum()) * time_step_h
+
+        def _sev(discharge):
+            return float(np.maximum((rl[ev_idx] + discharge) - thr, 0.0).sum()) * time_step_h
+
+        bat_dis  = np.maximum(bat_disp[ev_idx],  0.0)
+        pro_dis  = np.maximum(pro_disp[ev_idx],  0.0)
+        util_dis = np.maximum(util_disp[ev_idx], 0.0)
+        res_dis  = np.maximum(res_disp[ev_idx],  0.0)
+
+        sev_no_bat  = _sev(bat_dis)
+        sev_no_pro  = _sev(pro_dis)  if has_prosumer else np.nan
+        sev_no_util = _sev(util_dis) if has_utility  else np.nan
+        sev_no_res  = _sev(res_dis)
+        sev_no_both = _sev(bat_dis + res_dis)
+
+        def _atten(sev_no, flag):
+            if not flag:
+                return np.nan
+            return (sev_no - sev_actual) / sev_no * 100 if sev_no > 0 else 0.0
+
+        bat_dep.append(float(bat_dis.sum())  * time_step_h)
+        pro_dep.append(float(pro_dis.sum())  * time_step_h if has_prosumer else np.nan)
+        util_dep.append(float(util_dis.sum()) * time_step_h if has_utility  else np.nan)
+        res_dep.append(float(res_dis.sum())  * time_step_h)
+
+        bat_att.append(_atten(sev_no_bat,  has_battery))
+        pro_att.append(_atten(sev_no_pro,  has_prosumer))
+        util_att.append(_atten(sev_no_util, has_utility))
+        res_att.append(_atten(sev_no_res,  has_reservoir))
+        comb_att.append(
+            (sev_no_both - sev_actual) / sev_no_both * 100 if sev_no_both > 0 else 0.0
+        )
+
+        # Shapley split of combined attenuation between battery and reservoir.
+        if sev_no_both > 0:
+            phi_bat = 0.5 * (sev_no_both - sev_no_res) + 0.5 * (sev_no_bat - sev_actual)
+            phi_res = 0.5 * (sev_no_both - sev_no_bat) + 0.5 * (sev_no_res - sev_actual)
+            bat_share.append(phi_bat / sev_no_both * 100)
+            res_share.append(phi_res / sev_no_both * 100)
+        else:
+            bat_share.append(0.0)
+            res_share.append(0.0)
+
+    def _mean(lst):
+        arr = np.array(lst, dtype=float)
+        return float(np.nanmean(arr)) if arr.size else np.nan
+
+    return {
+        "n_events": len(events),
+        "battery_deployed_gwh_per_event":  _mean(bat_dep),
+        "prosumer_deployed_gwh_per_event": _mean(pro_dep),
+        "utility_deployed_gwh_per_event":  _mean(util_dep),
+        "reservoir_deployed_gwh_per_event": _mean(res_dep),
+        "battery_attenuation_pct":  _mean(bat_att),
+        "prosumer_attenuation_pct": _mean(pro_att),
+        "utility_attenuation_pct":  _mean(util_att),
+        "reservoir_attenuation_pct": _mean(res_att),
+        "combined_attenuation_pct": _mean(comb_att),
+        "battery_attenuation_share_pct":   _mean(bat_share),
+        "reservoir_attenuation_share_pct": _mean(res_share),
+    }
+
+
 def compute_flexibility_attenuation_metrics(
     cache_rl: dict,
     cache_comp: dict,
@@ -602,6 +890,7 @@ def compute_flexibility_attenuation_metrics(
     season_map: "dict[int, str] | None" = None,
     zone_dim: str = "zone",
     method: str = "run_length",
+    duration_bins: "dict | None" = None,
 ) -> pd.DataFrame:
     """Quantify battery and reservoir flexibility deployed during EVT events.
 
@@ -621,6 +910,12 @@ def compute_flexibility_attenuation_metrics(
         (``battery_dispatch_gwh``, ``prosumer_dispatch_gwh``,
         ``utility_dispatch_gwh``) and ``reservoir_dispatch_gwh`` are read
         from here.  Missing variables produce NaN metrics.
+
+        Under the lumped ``system`` flexibility scheme only ``battery_dispatch_gwh``
+        exists, so the per-asset ``prosumer_*`` / ``utility_*`` metrics are NaN and the
+        emitted ``battery_mode`` column is ``"lumped"`` — see :func:`battery_split_mode`.
+        Use :func:`flex_metric_columns` to select the metrics that carry data instead of
+        hardcoding column lists.
     evt_thresholds :
         Annual ``{model: xr.DataArray}`` or seasonal
         ``{model: {zone: {season: float}}}`` thresholds (auto-detected).
@@ -639,9 +934,30 @@ def compute_flexibility_attenuation_metrics(
     Returns
     -------
     pd.DataFrame
-        One row per (model, period, zone[, season]).  Columns include
-        ``n_events``, ``*_deployed_gwh_per_event``, ``*_attenuation_pct``, and
-        ``combined_attenuation_pct``.
+        One row per (model, period, zone[, season][, duration_class]).  When
+        ``duration_bins`` is given, events are partitioned into duration classes
+        and one row is emitted per class.  Columns include
+        ``n_events``, ``*_deployed_gwh_per_event``, ``*_attenuation_pct``,
+        ``combined_attenuation_pct``, and the string column ``battery_mode``.
+
+        The column schema is the same in every ``battery_mode`` (per-asset entries are
+        NaN when unavailable), so ``market`` and ``system`` runs can be concatenated and
+        compared.  ``battery_mode`` is *not* numeric — restrict broad aggregations
+        (``.mean()``, ``.median()``) to numeric columns, or select via
+        :func:`flex_metric_columns`.
+
+        Because ``battery_dispatch_gwh`` is the **total** storage dispatch in every
+        scheme, ``battery_deployed_gwh_per_event``, ``battery_attenuation_pct``,
+        ``combined_attenuation_pct`` and the Shapley shares are directly comparable
+        across ``market`` and ``system``; only the intra-battery breakdown is not.
+
+        Note that the per-resource ``*_attenuation_pct`` are *marginal*
+        (leave-one-out) quantities computed against independent counterfactual
+        denominators, so when battery and reservoir act on the same deficits
+        they overlap and can sum to more than 100 %. For an additive split use
+        ``battery_attenuation_share_pct`` and ``reservoir_attenuation_share_pct``
+        — a two-player Shapley decomposition of ``combined_attenuation_pct`` that
+        sums (at the per-event mean level) exactly to it.
     """
     from cordex2energy_analysis.plotting_extremes import resolve_model_periods
 
@@ -665,6 +981,9 @@ def compute_flexibility_attenuation_metrics(
         has_prosumer  = "prosumer_dispatch_gwh"  in ds_comp_m.data_vars
         has_utility   = "utility_dispatch_gwh"   in ds_comp_m.data_vars
         has_reservoir = "reservoir_dispatch_gwh" in ds_comp_m.data_vars
+        # Reported on every row so a NaN per-asset metric is distinguishable from a
+        # genuine zero, and so `market` and `system` runs can be concatenated.
+        battery_mode = battery_split_mode(ds_comp_m)
 
         resolved = {
             k: v for k, v in resolve_model_periods(period_defs, model).items()
@@ -720,88 +1039,26 @@ def compute_flexibility_attenuation_metrics(
                             rl = rl_full.copy()
                             rl[~s_mask] = thr - 1.0
                             events = detect_events(rl, thr, method=method)
-                    n_ev = len(events)
-
-                    base_row = {"model": model, "period": period_name, "zone": str(zone)}
+                    base_row = {
+                        "model": model, "period": period_name, "zone": str(zone),
+                        "battery_mode": battery_mode,
+                    }
                     if season is not None:
                         base_row["season"] = season
 
-                    if n_ev == 0:
-                        records.append({
-                            **base_row,
-                            "n_events": 0,
-                            "battery_deployed_gwh_per_event":  np.nan,
-                            "prosumer_deployed_gwh_per_event": np.nan,
-                            "utility_deployed_gwh_per_event":  np.nan,
-                            "reservoir_deployed_gwh_per_event": np.nan,
-                            "battery_attenuation_pct":  np.nan,
-                            "prosumer_attenuation_pct": np.nan,
-                            "utility_attenuation_pct":  np.nan,
-                            "reservoir_attenuation_pct": np.nan,
-                            "combined_attenuation_pct": np.nan,
-                        })
-                        continue
-
-                    bat_dep, pro_dep, util_dep, res_dep = [], [], [], []
-                    bat_att, pro_att, util_att, res_att, comb_att = [], [], [], [], []
-
-                    for ev in events:
-                        ev_idx = ev["indices"]
-                        sev_actual = float(np.maximum(rl[ev_idx] - thr, 0.0).sum()) * 3
-
-                        def _sev(discharge):
-                            # discharge must be the non-negative (discharge-only) portion.
-                            # Using raw dispatch (which includes negative/charging values)
-                            # would give a counterfactual severity below actual.
-                            return float(np.maximum((rl[ev_idx] + discharge) - thr, 0.0).sum()) * 3
-
-                        bat_dis  = np.maximum(bat_disp[ev_idx],  0.0)
-                        pro_dis  = np.maximum(pro_disp[ev_idx],  0.0)
-                        util_dis = np.maximum(util_disp[ev_idx], 0.0)
-                        res_dis  = np.maximum(res_disp[ev_idx],  0.0)
-
-                        sev_no_bat  = _sev(bat_dis)
-                        sev_no_pro  = _sev(pro_dis)  if has_prosumer else np.nan
-                        sev_no_util = _sev(util_dis) if has_utility  else np.nan
-                        sev_no_res  = _sev(res_dis)
-                        sev_no_both = _sev(bat_dis + res_dis)
-
-                        def _atten(sev_no, flag):
-                            if not flag:
-                                return np.nan
-                            return (sev_no - sev_actual) / sev_no * 100 if sev_no > 0 else 0.0
-
-                        bat_dep.append(float(bat_dis.sum())  * 3)
-                        pro_dep.append(float(pro_dis.sum())  * 3 if has_prosumer else np.nan)
-                        util_dep.append(float(util_dis.sum()) * 3 if has_utility  else np.nan)
-                        res_dep.append(float(res_dis.sum())  * 3)
-
-                        bat_att.append(_atten(sev_no_bat,  has_battery))
-                        pro_att.append(_atten(sev_no_pro,  has_prosumer))
-                        util_att.append(_atten(sev_no_util, has_utility))
-                        res_att.append(_atten(sev_no_res,  has_reservoir))
-                        comb_att.append(
-                            (sev_no_both - sev_actual) / sev_no_both * 100
-                            if sev_no_both > 0 else 0.0
-                        )
-
-                    def _mean(lst):
-                        arr = np.array(lst, dtype=float)
-                        return float(np.nanmean(arr)) if arr.size else np.nan
-
-                    records.append({
-                        **base_row,
-                        "n_events": n_ev,
-                        "battery_deployed_gwh_per_event":  _mean(bat_dep),
-                        "prosumer_deployed_gwh_per_event": _mean(pro_dep),
-                        "utility_deployed_gwh_per_event":  _mean(util_dep),
-                        "reservoir_deployed_gwh_per_event": _mean(res_dep),
-                        "battery_attenuation_pct":  _mean(bat_att),
-                        "prosumer_attenuation_pct": _mean(pro_att),
-                        "utility_attenuation_pct":  _mean(util_att),
-                        "reservoir_attenuation_pct": _mean(res_att),
-                        "combined_attenuation_pct": _mean(comb_att),
-                    })
+                    _flex_args = (rl, thr, bat_disp, pro_disp, util_disp, res_disp,
+                                  has_prosumer, has_utility, has_battery, has_reservoir)
+                    if duration_bins is None:
+                        records.append({**base_row, **_flex_event_metrics(events, *_flex_args)})
+                    else:
+                        _classified = {dc: [] for dc in duration_bins}
+                        for ev in events:
+                            _classified[classify_event_duration(ev["duration_h"], duration_bins)].append(ev)
+                        for dc, ev_list in _classified.items():
+                            records.append({
+                                **base_row, "duration_class": dc,
+                                **_flex_event_metrics(ev_list, *_flex_args),
+                            })
 
     return pd.DataFrame(records)
 
@@ -1344,3 +1601,659 @@ def compute_seasonal_duration_stratified_metrics(
                         })
 
     return pd.DataFrame(records)
+
+
+# ---------------------------------------------------------------------------
+# Paper figures: derived tables
+#
+# Everything below feeds the residual-load extremes paper
+# (``notebooks/paper_main_figures.ipynb``).  Each function takes its inputs
+# explicitly -- no reliance on notebook globals -- so the notebook can stay a
+# narrative and these can be tested and reused.
+#
+# Convention shared by the attribution helpers: residual load decomposes as
+#     RL = demand - PV - wind_on - wind_off - hydro_ror - reservoir - battery
+# so a *rise in demand* and a *fall in generation/storage* both RAISE the
+# deficit.  Contributions are therefore reported with demand entering at +sign
+# and every generation/storage term negated.
+# ---------------------------------------------------------------------------
+
+#: Residual-load components, mapped to their display names (the stacking order of the
+#: attribution bars).
+PAPER_COMPONENT_LABELS = {
+    "total_demand": "Demand",
+    "gen_pv": "PV",
+    "gen_wind_on": "Wind Onshore",
+    "gen_wind_off": "Wind Offshore",
+    "gen_hydro_ror": "Hydro RoR",
+    "reservoir_dispatch_gwh": "Reservoir Hydro",
+    "battery_dispatch_gwh": "Battery",
+}
+
+#: Hours (UTC) of the evening demand peak, when PV has already faded.
+EVENING_PEAK_HOURS = (15, 18, 21)
+
+
+def compute_evening_peak_attribution(
+    residual_load_by_model: dict,
+    components_by_model: dict,
+    period_defs: dict,
+    zones,
+    season_map: dict,
+    *,
+    hours=EVENING_PEAK_HOURS,
+    component_labels: dict | None = None,
+) -> pd.DataFrame:
+    """Mean of every residual-load component at the evening peak, per chain/period/zone/season.
+
+    Returns one row per (model, period, zone, season) with a ``RL`` column and one column per
+    driver.  ``season`` is ``"ALL"``, ``"DJF"`` or ``"JJA"`` -- the seasonal split is what exposes
+    the summer cooling-demand signal behind the sub-daily surge.
+    """
+    from .plotting_extremes import resolve_model_periods
+
+    labels = component_labels or PAPER_COMPONENT_LABELS
+    records = []
+    for model in residual_load_by_model:
+        rl_all, comp_all = residual_load_by_model[model], components_by_model[model]
+        windows = {k: v for k, v in resolve_model_periods(period_defs, model).items()
+                   if v is not None}
+        for period, (start, end) in windows.items():
+            rl = rl_all.sel(time=slice(start, end))
+            comp = comp_all.sel(time=slice(start, end))
+            hour = rl["time"].dt.hour.values
+            season = np.array([season_map[int(m)] for m in rl["time"].dt.month.values])
+            evening = np.isin(hour, list(hours))
+            for zone in zones:
+                rl_zone = rl["residual_load"].sel(zone=zone).values
+                comp_zone = {v: comp[v].sel(zone=zone).values for v in labels if v in comp}
+                for season_mask, season_label in [(np.ones_like(evening, bool), "ALL"),
+                                                  (season == "DJF", "DJF"),
+                                                  (season == "JJA", "JJA")]:
+                    mask = evening & season_mask
+                    if mask.sum() == 0:
+                        continue
+                    row = dict(model=model, period=period, zone=str(zone), season=season_label,
+                               RL=float(rl_zone[mask].mean()))
+                    for var, values in comp_zone.items():
+                        row[labels[var]] = float(values[mask].mean())
+                    records.append(row)
+    return pd.DataFrame(records)
+
+
+def compute_multi_day_table(
+    residual_load_by_model: dict,
+    components_by_model: dict,
+    threshold_by_model: dict,
+    period_defs: dict,
+    zones,
+    season_map: dict,
+    season_order,
+    *,
+    method: str = "spa",
+    min_duration_h: float = 24.0,
+    component_labels: dict | None = None,
+    attribution_seasons=("DJF", "JJA"),
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Multi-day events plus the WITHIN-SEASON component means used to attribute them.
+
+    Returns ``(multi_day_events, multi_day_by_season)``.
+
+    The attribution columns are named ``"{season}_{driver}"`` (and ``"{season}_RL"``) because the
+    attribution *must* be done within season: warming shifts these events from winter to summer in
+    the Mediterranean, so a season-pooled decomposition confounds the recomposition of the event
+    population with the physical change.
+    """
+    from .plotting_extremes import resolve_model_periods
+
+    labels = component_labels or PAPER_COMPONENT_LABELS
+    event_rows, season_rows = [], []
+    for model in residual_load_by_model:
+        rl_all, comp_all = residual_load_by_model[model], components_by_model[model]
+        windows = {k: v for k, v in resolve_model_periods(period_defs, model).items()
+                   if v is not None}
+        for period, (start, end) in windows.items():
+            rl = rl_all.sel(time=slice(start, end))
+            comp = comp_all.sel(time=slice(start, end))
+            n_years = len(np.unique(rl["time"].dt.year.values))
+            months = rl["time"].dt.month.values
+            seasons = np.array([season_map[int(m)] for m in months])
+
+            for zone in zones:
+                threshold = float(threshold_by_model[model].sel(zone=zone).values)
+                rl_zone = rl["residual_load"].sel(zone=zone).values
+                events = [e for e in detect_events(rl_zone, threshold, method=method)
+                          if e["duration_h"] > min_duration_h]
+                durations = [e["duration_h"] for e in events]
+                event_seasons = [season_map[int(months[e["indices"][0]])] for e in events]
+                comp_zone = {v: comp[v].sel(zone=zone).values for v in labels if v in comp}
+
+                row = dict(model=model, period=period, zone=str(zone),
+                           md_events_yr=len(durations) / n_years,
+                           md_meandur=float(np.mean(durations)) if durations else np.nan)
+                for season in attribution_seasons:
+                    mask = seasons == season
+                    row[f"{season}_RL"] = float(rl_zone[mask].mean())
+                    for var, values in comp_zone.items():
+                        row[f"{season}_{labels[var]}"] = float(values[mask].mean())
+                event_rows.append(row)
+
+                for season in season_order:
+                    season_rows.append(dict(
+                        model=model, period=period, zone=str(zone), season=season,
+                        md_events_yr=float(sum(1 for s in event_seasons if s == season)) / n_years,
+                        md_hours_yr=float(np.sum([d for d, s in zip(durations, event_seasons)
+                                                  if s == season])) / n_years))
+    return pd.DataFrame(event_rows), pd.DataFrame(season_rows)
+
+
+def attribution_change_by_model(
+    components: pd.DataFrame,
+    zone: str,
+    season: str,
+    reference_period: str,
+    warmest_period: str,
+    drivers,
+    *,
+    column_template: str = "{driver}",
+    net_column: str = "RL",
+    demand_driver: str = "Demand",
+) -> pd.DataFrame:
+    """PER-CHAIN driver contributions to the change in residual load (keeps the inter-model spread).
+
+    Works with both attribution tables:
+
+    * ``compute_evening_peak_attribution`` -- a ``season`` column, driver columns named directly
+      (defaults);
+    * ``compute_multi_day_table`` -- no ``season`` column, driver columns named
+      ``"{season}_{driver}"`` (pass ``column_template="{season}_{driver}"``,
+      ``net_column="{season}_RL"``).
+
+    Demand enters with a ``+`` sign; every generation/storage term is negated, because a *drop* in
+    generation raises the residual load.
+    """
+    rows = components[components.zone == zone]
+    if "season" in rows.columns:
+        rows = rows[rows.season == season]
+
+    columns = {d: column_template.format(driver=d, season=season) for d in drivers}
+    net = net_column.format(season=season)
+
+    reference = rows[rows.period == reference_period].set_index("model")
+    warmest = rows[rows.period == warmest_period].set_index("model")
+    common = reference.index.intersection(warmest.index)
+
+    wanted = [net] + list(columns.values())
+    delta = warmest.loc[common, wanted] - reference.loc[common, wanted]
+
+    out = pd.DataFrame(index=common)
+    for driver in drivers:
+        sign = 1.0 if driver == demand_driver else -1.0
+        out[driver] = sign * delta[columns[driver]]
+    out["net"] = delta[net]
+    return out
+
+
+def compute_deficit_budget(
+    residual_load_by_model: dict,
+    threshold_by_model: dict,
+    period_defs: dict,
+    zones,
+    *,
+    method: str = "spa",
+    sub_daily_max_h: float = 24.0,
+) -> tuple[pd.DataFrame, dict]:
+    """How the annual deficit budget splits between the sub-daily and multi-day timescales.
+
+    Returns ``(deficit_budget, diurnal_profiles)``.  ``diurnal_profiles[period]`` is a list of
+    Series (indexed by hour, named ``"model|zone"``) giving the residual load divided by the zone
+    threshold on *stressed days* -- calendar days carrying at least one exceedance.  That ratio is
+    what shows the midday solar trough and the evening peak.
+    """
+    from .plotting_extremes import resolve_model_periods
+
+    rows = []
+    diurnal: dict[str, list] = {period: [] for period in period_defs}
+    for model in residual_load_by_model:
+        rl_all = residual_load_by_model[model]
+        windows = {k: v for k, v in resolve_model_periods(period_defs, model).items()
+                   if v is not None}
+        for period, (start, end) in windows.items():
+            rl = rl_all.sel(time=slice(start, end))
+            n_years = len(np.unique(rl["time"].dt.year.values))
+            hours = rl["time"].dt.hour.values
+            days = rl["time"].dt.floor("D").values
+
+            for zone in zones:
+                threshold = float(threshold_by_model[model].sel(zone=zone).values)
+                values = rl["residual_load"].sel(zone=zone).values
+                exceeds = values > threshold
+                events = detect_events(values, threshold, method=method)
+                durations = (np.array([e["duration_h"] for e in events]) if events
+                             else np.array([]))
+                is_sub = (durations > 0) & (durations <= sub_daily_max_h)
+                is_multi = durations > sub_daily_max_h
+
+                frame = pd.DataFrame({"day": days, "hour": hours, "rl": values, "exc": exceeds})
+                stressed = frame[frame.groupby("day")["exc"].transform("any")]
+                if len(stressed):
+                    diurnal[period].append(
+                        (stressed.groupby("hour")["rl"].mean() / threshold)
+                        .rename(f"{model}|{zone}"))
+
+                rows.append(dict(
+                    model=model, period=period, zone=str(zone),
+                    sub_events_yr=int(is_sub.sum()) / n_years,
+                    multi_events_yr=int(is_multi.sum()) / n_years,
+                    sub_hours_yr=float(durations[is_sub].sum()) / n_years,
+                    multi_hours_yr=float(durations[is_multi].sum()) / n_years))
+    return pd.DataFrame(rows), diurnal
+
+
+def _season_values_by_period(residual_load_by_model, period_defs, zone, months, period_names,
+                             *, sort: bool = True) -> dict:
+    """Per-chain residual-load values for one zone, restricted to ``months``, for each period."""
+    out = {}
+    for period in period_names:
+        per_model = []
+        for model, dataset in residual_load_by_model.items():
+            window = period_defs[period].get(model)
+            if window is None:
+                continue
+            data = dataset["residual_load"].sel(
+                zone=zone, time=slice(str(window[0]), str(window[1])))
+            in_season = np.isin(data["time"].dt.month.values, list(months))
+            values = data.values[in_season]
+            values = values[np.isfinite(values)]
+            per_model.append(np.sort(values) if sort else values)
+        out[period] = per_model
+    return out
+
+
+def compute_survival_x_grid(
+    residual_load_by_model: dict,
+    period_defs: dict,
+    zone: str,
+    month_lists,
+    period_names,
+    *,
+    threshold: float | None = None,
+    n_points: int = 220,
+) -> np.ndarray:
+    """One x grid for a zone, pooled over SEVERAL month lists (i.e. across the displayed seasons).
+
+    Giving both seasons of a zone the same x-axis is what makes them comparable: the threshold then
+    sits at the same place in each, and a season whose distribution stops short of the threshold is
+    visibly a season with no exceedance -- no annotation required.
+
+    ``threshold``, if given, is kept inside the grid so the deficit level is always in frame even
+    where it lies above the whole distribution.
+    """
+    pooled = []
+    for months in month_lists:
+        by_period = _season_values_by_period(residual_load_by_model, period_defs, zone, months,
+                                             period_names, sort=False)
+        pooled.extend(v for per_model in by_period.values() for v in per_model)
+    pooled = np.concatenate(pooled)
+
+    low = float(np.percentile(pooled, 40))
+    high = float(np.percentile(pooled, 99.95))
+    if threshold is not None:
+        high = max(high, threshold * 1.02)
+    return np.linspace(low, high, n_points)
+
+
+def compute_exceedance_survival(
+    residual_load_by_model: dict,
+    period_defs: dict,
+    zone: str,
+    months,
+    period_names,
+    *,
+    spread: str = "iqr",
+    n_points: int = 220,
+    x: np.ndarray | None = None,
+) -> tuple[np.ndarray, dict]:
+    """Survival curve ``P(RL > x)`` per chain -> ensemble median + inter-model band.
+
+    A density plot cannot show a change confined to the top few per cent of the distribution; on a
+    log survival axis the warming levels fan out exactly where the events live.
+
+    Pass ``x`` (from :func:`compute_survival_x_grid`) to evaluate several seasons of a zone on one
+    shared grid, so their panels can be compared directly.
+    """
+    from .plotting_extremes import spread_qpair
+
+    q_low, q_high = spread_qpair(spread)
+    sorted_values = _season_values_by_period(residual_load_by_model, period_defs, zone, months,
+                                             period_names)
+
+    if x is None:
+        pooled = np.concatenate([np.concatenate(v) for v in sorted_values.values()])
+        x = np.linspace(np.percentile(pooled, 40), np.percentile(pooled, 99.95), n_points)
+
+    curves = {}
+    for period in period_names:
+        survival = np.vstack([1.0 - np.searchsorted(v, x, side="right") / len(v)
+                              for v in sorted_values[period]])
+        curves[period] = (np.median(survival, axis=0),
+                          np.percentile(survival, q_low, axis=0),
+                          np.percentile(survival, q_high, axis=0))
+    return x, curves
+
+
+def compute_exceedance_probability(
+    residual_load_by_model: dict,
+    period_defs: dict,
+    zone: str,
+    months,
+    period: str,
+    threshold: float,
+) -> float:
+    """Ensemble-median ``P(RL > threshold)``.
+
+    Evaluated exactly at the threshold rather than at the nearest grid point of a survival curve, so
+    a threshold lying outside the plotted range still returns the right (zero) answer.
+    """
+    probabilities = []
+    for model, dataset in residual_load_by_model.items():
+        window = period_defs[period].get(model)
+        if window is None:
+            continue
+        data = dataset["residual_load"].sel(zone=zone, time=slice(str(window[0]), str(window[1])))
+        in_season = np.isin(data["time"].dt.month.values, list(months))
+        values = data.values[in_season]
+        values = values[np.isfinite(values)]
+        probabilities.append(float(np.mean(values > threshold)))
+    return float(np.median(probabilities))
+
+
+def compute_country_gwl_field(
+    country_output_by_model: dict,
+    period_defs: dict,
+    period: str,
+    expression,
+    *,
+    scale: float = 1e-3,
+    months: "list[int] | None" = None,
+) -> "xr.DataArray":
+    """PER-CHAIN mean total of a country-level quantity over each chain's GWL window.
+
+    ``expression(dataset) -> DataArray(country, time)`` in GWh per timestep; ``scale`` converts the
+    total (default GWh -> TWh).  Returns ``(model, country)``.
+
+    With ``months=None`` (default) this is the mean ANNUAL total.  Pass a list of month numbers (e.g.
+    ``[12, 1, 2]`` for DJF) to restrict to a SEASON: the result is then the mean *seasonal* total
+    (the per-year sum over those months, averaged over the window's years).
+    """
+    per_model = []
+    for model, dataset in country_output_by_model.items():
+        window = period_defs[period].get(model)
+        if window is None:
+            continue
+        data = expression(dataset).sel(time=slice(str(window[0]), str(window[1])))
+        if months is not None:
+            data = data.sel(time=data["time"].dt.month.isin(months))
+        total = data.resample(time="YE").sum("time")
+        per_model.append((total.mean("time") * scale).expand_dims(model=[model]))
+    return xr.concat(per_model, dim="model")
+
+
+def compute_c2e_gwl_field(
+    c2e_by_variable: dict,
+    period_defs: dict,
+    period: str,
+    variable: str,
+    *,
+    scale: float = 1e-3,
+    months: "list[int] | None" = None,
+) -> "xr.DataArray":
+    """As :func:`compute_country_gwl_field`, for the c2e demand cache (``(model, country, time)``).
+
+    ``months`` restricts to a season (mean seasonal total) exactly as in
+    :func:`compute_country_gwl_field`; ``None`` gives the mean annual total.
+    """
+    per_model = []
+    for model in period_defs[period]:
+        window = period_defs[period].get(model)
+        if window is None:
+            continue
+        data = c2e_by_variable[variable].sel(
+            model=model, time=slice(str(window[0]), str(window[1])))
+        if months is not None:
+            data = data.sel(time=data["time"].dt.month.isin(months))
+        per_model.append(
+            (data.resample(time="YE").sum("time").mean("time") * scale).expand_dims(model=[model]))
+    return xr.concat(per_model, dim="model")
+
+
+def mask_structural_zeros(field: "xr.DataArray") -> "xr.DataArray":
+    """Turn structural zeros into NaN.
+
+    A country with no capacity for a technology stores 0, which on a sequential colour scale reads
+    as "low" rather than "absent".  NaN makes it grey.
+    """
+    return field.where(field != 0)
+
+
+def compute_annual_operation_curves(
+    components_by_model: dict,
+    period_defs: dict,
+    period: str,
+    variable: str,
+    selection: dict,
+    *,
+    mode: str = "sum",
+    smooth_days: int = 7,
+) -> "np.ndarray":
+    """Day-of-year operating curves over a GWL window — one curve per (chain, year).
+
+    Returns ``(n_curves, 365)``: every chain-year in the window, on a common day-of-year axis, ready
+    to draw as spaghetti or reduce to a median + percentile band.
+
+    ``selection`` picks the panel's slice, e.g. ``{"country": "NO"}`` or ``{"zone": "Nordic"}``.
+
+    ``mode``:
+      * ``"sum"``   — daily total (reservoir dispatch, GWh/day).
+      * ``"mean"``  — daily mean (reservoir storage, GWh).
+      * ``"throughput"`` — daily energy cycled, ``sum(|x|)/2``. **The only meaningful daily metric for
+        a battery**: its net daily dispatch is just the round-trip loss (~412 GWh/day cycled nets
+        ~-69 GWh/day at 85 % efficiency), so a net-dispatch curve shows the loss term, not operation.
+
+    Leap days are dropped (curves are truncated to 365) so every year shares one axis.
+    """
+    import pandas as _pd
+
+    curves = []
+    for model, dataset in components_by_model.items():
+        window = period_defs[period].get(model)
+        if window is None:
+            continue
+        series = dataset[variable].sel(**selection).sel(
+            time=slice(str(window[0]), str(window[1])))
+        if mode == "throughput":
+            daily = np.abs(series).resample(time="1D").sum() / 2
+        elif mode == "mean":
+            daily = series.resample(time="1D").mean()
+        else:
+            daily = series.resample(time="1D").sum()
+
+        for _, year_block in daily.groupby("time.year"):
+            values = year_block.values
+            if len(values) < 365:          # partial year at a window edge
+                continue
+            values = values[:365]
+            if smooth_days > 1:
+                values = (_pd.Series(values)
+                          .rolling(smooth_days, center=True, min_periods=1).mean().values)
+            curves.append(values)
+    return np.array(curves)
+
+
+def summarise_event_frequency(
+    events: pd.DataFrame,
+    duration_class: str,
+    zones,
+    period_names,
+    n_models: int,
+) -> pd.DataFrame:
+    """Headline table: events/yr per zone and period, with the % change and the chain agreement."""
+    subset = events[events.duration_class == duration_class]
+    table = (subset.pivot_table(index="zone", columns="period", values="freq_per_year",
+                                aggfunc="median")
+             .reindex(index=list(zones))[list(period_names)])
+    out = table.round(1).copy()
+
+    reference = period_names[0]
+    for period in period_names[1:]:
+        changes, agreements = [], []
+        for zone in zones:
+            per_zone = subset[subset.zone == zone]
+            ref = per_zone[per_zone.period == reference].set_index("model")["freq_per_year"]
+            warm = per_zone[per_zone.period == period].set_index("model")["freq_per_year"]
+            base = table.loc[zone, reference]
+            changes.append(100 * (table.loc[zone, period] - base) / base if base > 0 else np.nan)
+            delta = (warm - ref).reindex(ref.index).dropna()
+            sign = np.sign(np.median(delta))
+            agreements.append(int((np.sign(delta) == sign).sum()) if sign != 0 else 0)
+        out[f"%chg {period}"] = np.round(changes, 0)
+        out[f"agree {period}"] = [f"{a}/{n_models}" for a in agreements]
+    return out
+
+
+def compute_zone_season_change(
+    events_by_season: pd.DataFrame,
+    zones,
+    season_order,
+    period_names,
+    *,
+    spread: str = "iqr",
+) -> dict:
+    """% change in seasonal event count per (zone, season), with spread and chain agreement.
+
+    Returns ``{duration_class: {period: (median, low, high, n_agree)}}``, each a (zone, season)
+    array.  A cell is NaN where there were **no events at the reference level** -- that is a result
+    (the zone has no deficit problem in that season), not a gap.
+    """
+    from .plotting_extremes import spread_qpair
+
+    q_low, q_high = spread_qpair(spread)
+    reference = period_names[0]
+    shape = (len(zones), len(season_order))
+    out: dict = {}
+
+    for duration_class in events_by_season["duration_class"].unique():
+        subset = events_by_season[events_by_season.duration_class == duration_class]
+        out[duration_class] = {}
+        for period in period_names[1:]:
+            median = np.full(shape, np.nan)
+            low = np.full(shape, np.nan)
+            high = np.full(shape, np.nan)
+            n_agree = np.zeros(shape)
+            for i, zone in enumerate(zones):
+                for j, season in enumerate(season_order):
+                    cell = subset[(subset.zone == zone) & (subset.season == season)]
+                    ref = cell[cell.period == reference].set_index("model")["n_events"]
+                    warm = cell[cell.period == period].set_index("model")["n_events"]
+                    common = ref.index.intersection(warm.index)
+                    if len(common) == 0 or ref.loc[common].sum() == 0:
+                        continue
+                    change = (100 * (warm.loc[common] - ref.loc[common])
+                              / ref.loc[common].replace(0, np.nan))
+                    change = change.replace([np.inf, -np.inf], np.nan).dropna()
+                    if change.empty:
+                        continue
+                    median[i, j] = change.median()
+                    low[i, j] = np.percentile(change, q_low)
+                    high[i, j] = np.percentile(change, q_high)
+                    n_agree[i, j] = (np.sign(change) == np.sign(change.median())).sum()
+            out[duration_class][period] = (median, low, high, n_agree)
+    return out
+
+
+def compute_event_significance(
+    events_by_season: pd.DataFrame,
+    zones,
+    season_order,
+    period_names,
+) -> pd.DataFrame:
+    """Paired Wilcoxon signed-rank test on the per-chain seasonal event counts, plus agreement."""
+    from scipy.stats import wilcoxon
+
+    reference = period_names[0]
+    rows = []
+    for duration_class in events_by_season["duration_class"].unique():
+        subset = events_by_season[events_by_season.duration_class == duration_class]
+        for period in period_names[1:]:
+            for zone in zones:
+                for season in season_order:
+                    cell = subset[(subset.zone == zone) & (subset.season == season)]
+                    ref = cell[cell.period == reference].set_index("model")["n_events"]
+                    warm = cell[cell.period == period].set_index("model")["n_events"]
+                    common = ref.index.intersection(warm.index)
+                    x, y = ref.loc[common].values, warm.loc[common].values
+                    delta = y - x
+                    if len(delta) < 5 or np.all(delta == 0):
+                        pvalue = np.nan
+                    else:
+                        try:
+                            pvalue = wilcoxon(x, y, zero_method="zsplit").pvalue
+                        except Exception:
+                            pvalue = np.nan
+                    sign = np.sign(np.median(delta))
+                    rows.append(dict(
+                        duration_class=duration_class,
+                        comparison=f"{period} vs {reference}",
+                        zone=zone, season=season, p=pvalue,
+                        agree=(np.sign(delta) == sign).sum() / max(len(delta), 1)))
+    return pd.DataFrame(rows)
+
+
+def compute_threshold_sensitivity(
+    residual_load_by_model: dict,
+    period_defs: dict,
+    zones,
+    season_order,
+    season_months: dict,
+    zone_threshold,
+    seasonal_thresholds: dict,
+    *,
+    method: str = "spa",
+    sub_daily_max_h: float = 24.0,
+) -> pd.DataFrame:
+    """Event rates under the single annual threshold vs a season-specific one.
+
+    The seasonal masking is held fixed and only the threshold varies, so the comparison isolates the
+    threshold choice.  A season-specific p95 forces ~5 % exceedance in *every* season of the
+    reference climate by construction: it re-baselines each season to its own tail (erasing the
+    winter->summer migration) and manufactures events in seasons that have no deficit problem.
+    """
+    from .plotting_extremes import resolve_model_periods
+
+    rows = []
+    for model, dataset in residual_load_by_model.items():
+        windows = {k: v for k, v in resolve_model_periods(period_defs, model).items()
+                   if v is not None}
+        for period, (start, end) in windows.items():
+            data = dataset.sel(time=slice(start, end))
+            times = pd.DatetimeIndex(data["time"].values)
+            n_years = len(np.unique(times.year))
+            for zone in zones:
+                values = data["residual_load"].sel(zone=zone).values
+                for season in season_order:
+                    schemes = {
+                        "annual": float(zone_threshold.sel(zone=zone)),
+                        "seasonal": float(seasonal_thresholds[str(zone)][season]),
+                    }
+                    for scheme, threshold in schemes.items():
+                        events = detect_seasonal_events(
+                            values, times, threshold, season_months[season],
+                            time_step_h=3.0, method=method)
+                        durations = (np.array([e["duration_h"] for e in events]) if events
+                                     else np.array([]))
+                        rows.append(dict(
+                            model=model, period=period, zone=str(zone), season=season,
+                            scheme=scheme,
+                            sub_daily=int((durations <= sub_daily_max_h).sum()) / n_years,
+                            multi_day=int((durations > sub_daily_max_h).sum()) / n_years))
+    return pd.DataFrame(rows)
