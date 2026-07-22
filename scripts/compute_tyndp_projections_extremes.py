@@ -15,6 +15,7 @@ projection scenario (LOW/BE/HIGH) with an associated target year, this script:
 """
 
 import argparse
+import time
 import json
 import os
 from pathlib import Path
@@ -24,6 +25,7 @@ import pandas as pd
 import xarray as xr
 
 from cordex2energy.conversion_energy.tyndp import (
+    aggregate_battery_capacities_by_zone,
     aggregate_by_balancing_zones,
     apply_battery_dispatch,
     apply_prosumer_battery_dispatch,
@@ -36,6 +38,7 @@ from cordex2energy.conversion_energy.tyndp import (
     compute_residual_load,
     compute_or_load_baseload,
     drop_overlapping_zones,
+    load_c2e_demand_nc,
     load_nuts_geodata,
     load_tyndp_battery_capacities,
     load_tyndp_country_codes,
@@ -43,6 +46,7 @@ from cordex2energy.conversion_energy.tyndp import (
     load_tyndp_supply_capacities,
     preprocess_hydro_ror,
 )
+from cordex2energy.utils.constants import REFERENCE_PERIOD
 
 # Limit internal threading of numerical libraries so that Dask can manage
 # parallelism at the worker level without contention.
@@ -60,6 +64,7 @@ def load_cordex_energy_data(
     rcp_suffix: str,
     turbine_fn: str,
     name_to_iso2: dict,
+    demand_model: str = "demand.ninja",
 ) -> dict:
     """Load all CORDEX-derived energy datasets needed for residual load computation.
 
@@ -152,37 +157,44 @@ def load_cordex_energy_data(
         name="inflow",
     ).to_dataset()
 
-    print("  Loading heating demand …")
-    df_heating = pd.read_csv(
-        _c2e_model_dir
-        / f"heating-demand_CORDEX_{model_prefix}_{rcp_suffix}.csv",
-        index_col=0,
-    )
-    ds_heating_demand = xr.DataArray(
-        df_heating.values,
-        dims=["country", "time"],
-        coords={
-            "country": [name_to_iso2.get(c, c) for c in df_heating.index],
-            "time": pd.to_datetime(df_heating.columns),
-        },
-        name="heating_demand",
-    ).to_dataset()
+    if demand_model == "cordex2energy_demand":
+        print("  Loading heating/cooling demand (JRC cordex2energy_demand NetCDF) …")
+        ds_heating_demand, ds_cooling_demand = load_c2e_demand_nc(
+            path_energy_europe / "demand" / f"{climate_model}_{climate_scenario}.nc",
+            name_to_iso2,
+        )
+    else:
+        print("  Loading heating demand …")
+        df_heating = pd.read_csv(
+            _c2e_model_dir
+            / f"heating-demand_CORDEX_{model_prefix}_{rcp_suffix}.csv",
+            index_col=0,
+        )
+        ds_heating_demand = xr.DataArray(
+            df_heating.values,
+            dims=["country", "time"],
+            coords={
+                "country": [name_to_iso2.get(c, c) for c in df_heating.index],
+                "time": pd.to_datetime(df_heating.columns),
+            },
+            name="heating_demand",
+        ).to_dataset()
 
-    print("  Loading cooling demand …")
-    df_cooling = pd.read_csv(
-        _c2e_model_dir
-        / f"cooling-demand_CORDEX_{model_prefix}_{rcp_suffix}.csv",
-        index_col=0,
-    )
-    ds_cooling_demand = xr.DataArray(
-        df_cooling.values,
-        dims=["country", "time"],
-        coords={
-            "country": [name_to_iso2.get(c, c) for c in df_cooling.index],
-            "time": pd.to_datetime(df_cooling.columns),
-        },
-        name="cooling_demand",
-    ).to_dataset()
+        print("  Loading cooling demand …")
+        df_cooling = pd.read_csv(
+            _c2e_model_dir
+            / f"cooling-demand_CORDEX_{model_prefix}_{rcp_suffix}.csv",
+            index_col=0,
+        )
+        ds_cooling_demand = xr.DataArray(
+            df_cooling.values,
+            dims=["country", "time"],
+            coords={
+                "country": [name_to_iso2.get(c, c) for c in df_cooling.index],
+                "time": pd.to_datetime(df_cooling.columns),
+            },
+            name="cooling_demand",
+        ).to_dataset()
 
     return {
         "ds_pv": ds_pv,
@@ -199,6 +211,7 @@ def load_cerra_energy_data(
     path_energy_europe: Path,
     turbine_fn: str,
     name_to_iso2: dict,
+    demand_model: str = "demand.ninja",
 ) -> dict:
     """Load CERRA-derived energy datasets for residual load computation."""
     print("  Loading CERRA PV capacity factors …")
@@ -258,35 +271,43 @@ def load_cerra_energy_data(
         name="inflow",
     ).to_dataset()
 
-    print("  Loading CERRA heating demand …")
-    df_heating = pd.read_csv(
-        _c2e_cerra_dir / "heating-demand_CERRA.csv",
-        index_col=0,
-    )
-    ds_heating_demand = xr.DataArray(
-        df_heating.values,
-        dims=["country", "time"],
-        coords={
-            "country": [name_to_iso2.get(str(c).strip(), str(c).strip()) for c in df_heating.index],
-            "time": pd.to_datetime(df_heating.columns),
-        },
-        name="heating_demand",
-    ).to_dataset()
+    if demand_model == "cordex2energy_demand":
+        print("  Loading CERRA heating/cooling demand (JRC cordex2energy_demand NetCDF) …")
+        ds_heating_demand, ds_cooling_demand = load_c2e_demand_nc(
+            path_energy_europe / "demand" / "cerra.nc",
+            name_to_iso2,
+            time_slice=REFERENCE_PERIOD,
+        )
+    else:
+        print("  Loading CERRA heating demand …")
+        df_heating = pd.read_csv(
+            _c2e_cerra_dir / "heating-demand_CERRA.csv",
+            index_col=0,
+        )
+        ds_heating_demand = xr.DataArray(
+            df_heating.values,
+            dims=["country", "time"],
+            coords={
+                "country": [name_to_iso2.get(str(c).strip(), str(c).strip()) for c in df_heating.index],
+                "time": pd.to_datetime(df_heating.columns),
+            },
+            name="heating_demand",
+        ).to_dataset()
 
-    print("  Loading CERRA cooling demand …")
-    df_cooling = pd.read_csv(
-        _c2e_cerra_dir / "cooling-demand_CERRA.csv",
-        index_col=0,
-    )
-    ds_cooling_demand = xr.DataArray(
-        df_cooling.values,
-        dims=["country", "time"],
-        coords={
-            "country": [name_to_iso2.get(str(c).strip(), str(c).strip()) for c in df_cooling.index],
-            "time": pd.to_datetime(df_cooling.columns),
-        },
-        name="cooling_demand",
-    ).to_dataset()
+        print("  Loading CERRA cooling demand …")
+        df_cooling = pd.read_csv(
+            _c2e_cerra_dir / "cooling-demand_CERRA.csv",
+            index_col=0,
+        )
+        ds_cooling_demand = xr.DataArray(
+            df_cooling.values,
+            dims=["country", "time"],
+            coords={
+                "country": [name_to_iso2.get(str(c).strip(), str(c).strip()) for c in df_cooling.index],
+                "time": pd.to_datetime(df_cooling.columns),
+            },
+            name="cooling_demand",
+        ).to_dataset()
 
     return {
         "ds_pv": ds_pv.sel(time=slice("1991", "2020")),
@@ -343,6 +364,30 @@ if __name__ == "__main__":
         default=2050,
         choices=[2019, 2040, 2050],
         help="Target year for the demand scenario (2019 for REF; 2040 or 2050 for GA/DE).",
+    )
+    parser.add_argument(
+        "--demand_model",
+        type=str,
+        default="demand.ninja",
+        choices=["demand.ninja", "cordex2energy_demand"],
+        help=(
+            "Source of the climate-driven heating/cooling demand. "
+            "'demand.ninja' (default) uses the 3-hourly c2e CSVs; "
+            "'cordex2energy_demand' uses the hourly JRC-coefficient NetCDFs "
+            "(energy/europe/demand/*.nc). The choice is encoded in the run tag "
+            "and the baseload cache key."
+        ),
+    )
+    parser.add_argument(
+        "--legacy_thermal",
+        action="store_true",
+        default=False,
+        help=(
+            "Reproduce the historical thermal handling: lump heating+cooling "
+            "into one target, compute the rescale factor over the whole series "
+            "(not the reference period), and disable baseload modulation. "
+            "For validation against pre-change runs."
+        ),
     )
     parser.add_argument(
         "--supply_scenario",
@@ -406,11 +451,21 @@ if __name__ == "__main__":
     parser.add_argument(
         "--reservoir_min_storage_fraction",
         type=float,
-        default=None,
+        default=0.1,
         help=(
             "Minimum reservoir storage level as a fraction of maximum capacity "
             "(e.g. 0.05).  Passed to the Gurobi QP as a lower bound on storage "
             "at every time step.  Default None (no floor)."
+        ),
+    )
+    parser.add_argument(
+        "--reservoir_efficiency",
+        type=float,
+        default=0.9,
+        help=(
+            "Reservoir turbine (water-to-wire) conversion efficiency in (0, 1]. "
+            "Generating G electrical GWh draws G / efficiency from storage "
+            "(default 0.9)."
         ),
     )
     parser.add_argument(
@@ -450,9 +505,77 @@ if __name__ == "__main__":
         "--battery_dispatch_lookahead_h",
         type=float,
         default=24.0,
-        help="Lookahead window in hours for utility battery discharge rationing (default 24).",
+        help=(
+            "Utility battery foresight window in hours (default 24). "
+            "For --battery_dispatch_method heuristic this is the greedy-discharge "
+            "rationing window; for 'optimal' it is the extra look-ahead solved "
+            "beyond --battery_commit_h and then discarded (rolling day-ahead overlap)."
+        ),
+    )
+    parser.add_argument(
+        "--battery_dispatch_method",
+        type=str,
+        default="heuristic",
+        choices=["heuristic", "optimal"],
+        help=(
+            "Utility battery dispatch method (prosumer batteries are always "
+            "heuristic). 'heuristic' (default) uses the greedy lookahead loop; "
+            "'optimal' runs a rolling day-ahead QP (Gurobi) that minimises squared "
+            "net residual load over a "
+            "--battery_commit_h + --battery_dispatch_lookahead_h window, committing "
+            "only the first --battery_commit_h. Requires a Gurobi licence."
+        ),
+    )
+    parser.add_argument(
+        "--battery_commit_h",
+        type=float,
+        default=24.0,
+        help=(
+            "Committed (kept) horizon in hours per rolling day-ahead solve, and the "
+            "window slide step. Used only with --battery_dispatch_method optimal "
+            "(default 24)."
+        ),
+    )
+    parser.add_argument(
+        "--battery_min_soc_fraction",
+        type=float,
+        default=None,
+        help=(
+            "Minimum utility battery state-of-charge as a fraction of capacity, used "
+            "only with --battery_dispatch_method optimal. Default None (no floor)."
+        ),
+    )
+    parser.add_argument(
+        "--flexibility_scheme",
+        type=str,
+        default="market",
+        choices=["market", "system"],
+        help=(
+            "How storage is operated. 'market' (default) models each asset as it is "
+            "operated in a market: prosumer batteries use the behind-the-meter "
+            "heuristic and utility batteries use --battery_dispatch_method at "
+            "--utility_dispatch_level. 'system' instead dispatches ALL flexibility "
+            "under one scheme consistent with the reservoir: prosumer + utility "
+            "batteries are lumped into a single storage asset and optimised with the "
+            "annual-cyclical perfect-foresight QP at country level (net-load-event "
+            "mitigation). Under 'system', --battery_dispatch_method and "
+            "--utility_dispatch_level are ignored."
+        ),
+    )
+    parser.add_argument(
+        "--utility_dispatch_level",
+        type=str,
+        default="zone",
+        choices=["zone", "country"],
+        help=(
+            "Spatial level for utility battery dispatch. 'zone' (default) pools "
+            "utility batteries across the 6 real-time balancing zones (grid/merchant "
+            "assets, ~5x fewer QP solves); 'country' dispatches per country. Prosumer "
+            "batteries and reservoir hydro are always country-level."
+        ),
     )
 
+    t0 = time.time()
     args = parser.parse_args()
 
     # ── Derived parameters ────────────────────────────────────────────────────────
@@ -464,6 +587,15 @@ if __name__ == "__main__":
     supply_scenario = args.supply_scenario
     supply_year = args.supply_year
     rolling_window_residual_load = args.rolling_window_residual_load
+
+    # Demand-model selection. The hourly cordex2energy_demand NetCDFs must NOT be
+    # cubic-upsampled (only resampled to 3-hourly sums); the 3-hourly demand.ninja
+    # CSVs are upsampled to 1 h first. The model is encoded in the run tag and the
+    # baseload cache key so runs never collide.
+    demand_model = args.demand_model
+    legacy_thermal = args.legacy_thermal
+    dm_tag = {"demand.ninja": "dninja", "cordex2energy_demand": "c2edem"}[demand_model]
+    upsample_to_1h = demand_model == "demand.ninja"
 
     is_cerra = climate_model.lower() == "cerra"
 
@@ -483,7 +615,13 @@ if __name__ == "__main__":
     print(f"Climate model    : {climate_model}")
     print(f"Climate scenario : {climate_scenario}")
     print(f"Demand scenario  : {demand_scenario} {demand_year}")
+    print(f"Demand model     : {demand_model}"
+          f"{' (legacy thermal)' if legacy_thermal else ''}")
     print(f"Supply scenario  : {supply_scenario} ({supply_scenario_col}) {supply_year}")
+    print(f"Wind Turbine: {args.turbine}")
+    print(f"Flexibility scheme: {args.flexibility_scheme}")
+    print(f"Battery dispatch method: {args.battery_dispatch_method}")
+    print(f"Utility dispatch level: {args.utility_dispatch_level}")
 
     # ── Dask ──────────────────────────────────────────────────────────────────────
 
@@ -511,11 +649,16 @@ if __name__ == "__main__":
     path_baseload_cache = path_tyndp / "baseload"
 
     # Build run tag before path_out so it can be used as the output subfolder.
+    # The demand-model token is always present (the demand series — and therefore
+    # the whole residual-load system — differs by model); the legacy-thermal
+    # marker is appended only when that flag is set.
     _model_tag = model_prefix
     _run_tag = (
-        f"{demand_scenario}_{demand_year}"
+        f"{demand_scenario}_{demand_year}_{dm_tag}"
         f"_{supply_scenario}_{supply_year}"
     )
+    if legacy_thermal:
+        _run_tag += "_legacythermal"
     if rolling_window_residual_load and rolling_window_residual_load > 1:
         _run_tag += f"_rlsmooth_{rolling_window_residual_load}"
     if args.use_reservoir_hydro:
@@ -524,6 +667,23 @@ if __name__ == "__main__":
         _run_tag += "_batteries"
         if args.use_prosumer_batteries:
             _run_tag += "_prosumer"
+        if args.flexibility_scheme == "system":
+            # Lumped batteries + annual QP at country level; the method/level flags
+            # do not apply, so they are not encoded in the tag.
+            _run_tag += "_sysflex"
+        else:
+            if args.battery_dispatch_method == "optimal":
+                _run_tag += "_optbatt"
+            # Default utility level is 'zone'; tag only the non-default so the common
+            # case keeps stable folder names and country-level comparison runs don't
+            # collide with zone-level outputs.
+            if args.utility_dispatch_level == "country":
+                _run_tag += "_utilcountry"
+
+    # The turbine is ALWAYS tagged, including the default. It sets the wind capacity factor outright
+    # (mean onshore CF is 0.20 for E-126/7580 vs 0.40 for SWT142/3150), so two runs that differ only in
+    # turbine are different systems and must never share an output folder.
+    _run_tag += f"_{turbine_fn}"
 
     # Output directory: one subfolder per run configuration.
     _model_subdir = "cerra" if is_cerra else f"{climate_model}_{climate_scenario}"
@@ -604,6 +764,7 @@ if __name__ == "__main__":
             path_energy_europe=path_data_energy_europe,
             turbine_fn=turbine_fn,
             name_to_iso2=C2E_NAME_TO_ISO2,
+            demand_model=demand_model,
         )
     else:
         print("\n── Loading CORDEX energy data ───────────────────────────────────────────────")
@@ -616,6 +777,7 @@ if __name__ == "__main__":
             rcp_suffix=rcp_suffix,
             turbine_fn=turbine_fn,
             name_to_iso2=C2E_NAME_TO_ISO2,
+            demand_model=demand_model,
         )
     ds_pv = energy_data["ds_pv"]
     ds_wind = energy_data["ds_wind"]
@@ -628,6 +790,8 @@ if __name__ == "__main__":
     # ── Compute or load baseload ──────────────────────────────────────────────────
 
     print("\n── Computing / loading TYNDP baseload ───────────────────────────────────────")
+    # Baseload uses the SAME demand model as the residual load (subtract-then-add
+    # symmetry) and, unless legacy, is modulated to (TYNDP total − heat − cool).
     ds_tyndp_baseload_typical = compute_or_load_baseload(
         path_c2e_cerra=path_data_processed / "c2e" / "outputs" / "CERRA",
         path_baseload_cache=path_baseload_cache,
@@ -637,6 +801,11 @@ if __name__ == "__main__":
         df_tyndp_demand=df_tyndp_demand,
         C2E_NAME_TO_ISO2=C2E_NAME_TO_ISO2,
         floor_fraction=args.floor_fraction,
+        demand_model=demand_model,
+        path_energy_demand=path_data_energy_europe / "demand",
+        modulate_baseload=not legacy_thermal,
+        reference_period=REFERENCE_PERIOD,
+        legacy_thermal=legacy_thermal,
     )
 
     # ── Build thermal targets for residual load computation ───────────────────────
@@ -653,7 +822,29 @@ if __name__ == "__main__":
         year=demand_year,
         ds_market=_ds_market_for_targets,
     )
-    print(f"  {len(thermal_targets)} countries with thermal targets.")
+    print(f"  heating targets: {len(thermal_targets['heating'])}, "
+          f"cooling targets: {len(thermal_targets['cooling'])}, "
+          f"total (TYNDP-scenario) countries: {len(thermal_targets['total'])}.")
+
+    # Residual-load target form. Split heating/cooling targets ONLY for
+    # cordex2energy_demand; demand.ninja uses a single lumped target (its
+    # near-zero reference-period cooling makes a split k_cool blow up in cool
+    # countries). Legacy additionally drops the reference-period anchor.
+    split_targets = (demand_model == "cordex2energy_demand") and not legacy_thermal
+    if split_targets:
+        residual_targets = {
+            "heating_demand": thermal_targets["heating"],
+            "cooling_demand": thermal_targets["cooling"],
+        }
+    else:
+        residual_targets = {
+            c: thermal_targets["heating"].get(c, 0.0) + thermal_targets["cooling"].get(c, 0.0)
+            for c in set(thermal_targets["heating"]) | set(thermal_targets["cooling"])
+        }
+    residual_reference_period = None if legacy_thermal else REFERENCE_PERIOD
+    # cordex2energy_demand is already electric → no COP loss factor (it cancels
+    # under target rescaling anyway, but matters for unmatched Balkan countries).
+    thermal_loss_factor = 1.0 if demand_model == "cordex2energy_demand" else 1.176
 
     # ── Compute estimated generation ──────────────────────────────────────────────
 
@@ -690,7 +881,10 @@ if __name__ == "__main__":
         ds_tyndp_baseload_typical,   # typical-year (hour_of_year dim) — auto-expanded
         ds_heating_demand,
         ds_cooling_demand,
-        target_twh_per_country=thermal_targets,
+        target_twh_per_country=residual_targets,
+        loss_factor=thermal_loss_factor,
+        upsample_to_1h=upsample_to_1h,
+        reference_period=residual_reference_period,
         return_generation_demand_components=True,
         rolling_window_residual_load=rolling_window_residual_load,
     )
@@ -704,6 +898,7 @@ if __name__ == "__main__":
             ds_hydro_inflow,
             df_hydro_capacities,
             min_storage_level_fraction=args.reservoir_min_storage_fraction,
+            efficiency=args.reservoir_efficiency,
         )
         # Updated residual load only — reservoir state variables go to components.
         ds_residual_load = _ds_reservoir.drop_vars(
@@ -726,8 +921,51 @@ if __name__ == "__main__":
         )
 
         prosumer_dispatch_gwh = None
+        utility_dispatch_gwh = None
+
+    # ── 'system' scheme: lumped batteries, annual-cyclical QP, country level ───
+    if args.use_batteries and args.flexibility_scheme == "system":
+        # Prosumer + utility are a single storage asset, dispatched with the same
+        # objective and horizon as the reservoir (sequentially, after it).
+        s_batt_total = (
+            s_batt_utility.add(s_batt_prosumer, fill_value=0.0)
+            if args.use_prosumer_batteries
+            else s_batt_utility
+        )
+        _lump = "prosumer + utility" if args.use_prosumer_batteries else "utility only"
+        print(f"  Lumped batteries ({_lump}), annual-cyclical QP, country level …")
+        print(
+            "  [INFO] --battery_dispatch_method and --utility_dispatch_level are "
+            "ignored under --flexibility_scheme system."
+        )
+        _ds_batt = apply_battery_dispatch(
+            ds_residual_load,
+            s_batt_total,
+            battery_duration_h=args.battery_duration_h,
+            roundtrip_efficiency=args.battery_roundtrip_eff,
+            zone_dim="country",
+            method="annual",
+            min_soc_fraction=args.battery_min_soc_fraction,
+        )
+        battery_dispatch_gwh = _ds_batt["battery_dispatch_gwh"]
+        battery_soc_gwh = _ds_batt["soc_gwh"]
+        ds_residual_load = _ds_batt.assign(
+            residual_load=_ds_batt["residual_load_with_batteries"]
+        ).drop_vars(["residual_load_with_batteries", "soc_gwh", "battery_dispatch_gwh"])
+        # Only the combined dispatch exists in this scheme (no prosumer/utility split).
+        ds_components = ds_components.assign(
+            battery_dispatch_gwh=battery_dispatch_gwh,
+            battery_soc_gwh=battery_soc_gwh,
+        )
+        print("  Done.")
+
+    # ── 'market' scheme: prosumer heuristic + utility (rolling/greedy) ─────────
+    if args.use_batteries and args.flexibility_scheme == "market":
         if args.use_prosumer_batteries:
             print("  Prosumer batteries (PV-aware, daily cycling) …")
+            # Prosumer batteries are behind-the-meter self-consumption assets and are
+            # always dispatched with the greedy heuristic (the optimal QP applies to
+            # utility batteries only).
             _ds_pro = apply_prosumer_battery_dispatch(
                 ds_residual_load,
                 ds_components["gen_pv"],
@@ -743,33 +981,95 @@ if __name__ == "__main__":
             ).drop_vars(["residual_load_with_batteries", "soc_gwh", "battery_dispatch_gwh"])
             ds_components = ds_components.assign(prosumer_dispatch_gwh=prosumer_dispatch_gwh)
 
-        print(f"  Utility batteries (lookahead={args.battery_dispatch_lookahead_h:.0f} h) …")
-        _ds_util = apply_battery_dispatch(
-            ds_residual_load,
-            s_batt_utility,
-            battery_duration_h=args.battery_duration_h,
-            roundtrip_efficiency=args.battery_roundtrip_eff,
-            initial_soc_fraction=args.battery_initial_soc,
-            dispatch_lookahead_h=args.battery_dispatch_lookahead_h,
-            zone_dim="country",
-        )
-        utility_dispatch_gwh = _ds_util["battery_dispatch_gwh"]
-        ds_residual_load = _ds_util.assign(
-            residual_load=_ds_util["residual_load_with_batteries"]
-        ).drop_vars(["residual_load_with_batteries", "soc_gwh", "battery_dispatch_gwh"])
-        ds_components = ds_components.assign(utility_dispatch_gwh=utility_dispatch_gwh)
+        # Describe the utility dispatch method once (reused across levels).
+        if args.battery_dispatch_method == "optimal":
+            _util_desc = (
+                f"optimal, rolling day-ahead: commit={args.battery_commit_h:.0f} h, "
+                f"lookahead={args.battery_dispatch_lookahead_h:.0f} h"
+            )
+        else:
+            _util_desc = f"lookahead={args.battery_dispatch_lookahead_h:.0f} h"
 
-        battery_dispatch_gwh = (
-            prosumer_dispatch_gwh + utility_dispatch_gwh
-            if prosumer_dispatch_gwh is not None
-            else utility_dispatch_gwh
-        )
-        ds_components = ds_components.assign(battery_dispatch_gwh=battery_dispatch_gwh)
+        # Utility batteries are dispatched at country level here only when
+        # --utility_dispatch_level country; the default ('zone') defers utility
+        # dispatch to after zonal aggregation (see below).
+        if args.utility_dispatch_level == "country":
+            print(f"  Utility batteries (country, {_util_desc}) …")
+            _ds_util = apply_battery_dispatch(
+                ds_residual_load,
+                s_batt_utility,
+                battery_duration_h=args.battery_duration_h,
+                roundtrip_efficiency=args.battery_roundtrip_eff,
+                initial_soc_fraction=args.battery_initial_soc,
+                dispatch_lookahead_h=args.battery_dispatch_lookahead_h,
+                zone_dim="country",
+                method=args.battery_dispatch_method,
+                min_soc_fraction=args.battery_min_soc_fraction,
+                commit_h=args.battery_commit_h,
+            )
+            utility_dispatch_gwh = _ds_util["battery_dispatch_gwh"]
+            ds_residual_load = _ds_util.assign(
+                residual_load=_ds_util["residual_load_with_batteries"]
+            ).drop_vars(["residual_load_with_batteries", "soc_gwh", "battery_dispatch_gwh"])
+            ds_components = ds_components.assign(utility_dispatch_gwh=utility_dispatch_gwh)
+
+        # Country-level combined battery dispatch (prosumer, plus utility if it was
+        # dispatched at country level).  When utility is zone-level this holds prosumer
+        # only; the zonal total is assembled after aggregation.
+        _country_batt_parts = [
+            p for p in (prosumer_dispatch_gwh, utility_dispatch_gwh) if p is not None
+        ]
+        if _country_batt_parts:
+            ds_components = ds_components.assign(
+                battery_dispatch_gwh=sum(_country_batt_parts)
+            )
         print("  Done.")
 
     # Aggregate from individual countries to real-time balancing zones.
     ds_residual_load_zonal = aggregate_by_balancing_zones(ds_residual_load)
     ds_components_zonal = aggregate_by_balancing_zones(ds_components)
+
+    # ── Zone-level utility battery dispatch ────────────────────────────────────
+    # Utility-scale batteries are grid/merchant assets, pooled across the 6 balancing
+    # zones and dispatched on the (post reservoir + prosumer) zonal residual load.
+    if (
+        args.use_batteries
+        and args.flexibility_scheme == "market"
+        and args.utility_dispatch_level == "zone"
+    ):
+        print("\n── Applying zone-level utility battery dispatch ─────────────────────────────")
+        s_util_zone = aggregate_battery_capacities_by_zone(s_batt_utility)
+        print(f"  Utility batteries (zone, {_util_desc}) …")
+        _ds_util_zone = apply_battery_dispatch(
+            ds_residual_load_zonal,
+            s_util_zone,
+            battery_duration_h=args.battery_duration_h,
+            roundtrip_efficiency=args.battery_roundtrip_eff,
+            initial_soc_fraction=args.battery_initial_soc,
+            dispatch_lookahead_h=args.battery_dispatch_lookahead_h,
+            zone_dim="zone",
+            method=args.battery_dispatch_method,
+            min_soc_fraction=args.battery_min_soc_fraction,
+            commit_h=args.battery_commit_h,
+        )
+        utility_dispatch_gwh_zonal = _ds_util_zone["battery_dispatch_gwh"]
+        ds_residual_load_zonal = _ds_util_zone.assign(
+            residual_load=_ds_util_zone["residual_load_with_batteries"]
+        ).drop_vars(["residual_load_with_batteries", "soc_gwh", "battery_dispatch_gwh"])
+        ds_components_zonal = ds_components_zonal.assign(
+            utility_dispatch_gwh=utility_dispatch_gwh_zonal
+        )
+        # Combined zonal battery dispatch = zonal prosumer (if any) + zonal utility.
+        if "prosumer_dispatch_gwh" in ds_components_zonal:
+            ds_components_zonal = ds_components_zonal.assign(
+                battery_dispatch_gwh=ds_components_zonal["prosumer_dispatch_gwh"]
+                + utility_dispatch_gwh_zonal
+            )
+        else:
+            ds_components_zonal = ds_components_zonal.assign(
+                battery_dispatch_gwh=utility_dispatch_gwh_zonal
+            )
+        print("  Done.")
 
     # ── Save outputs ──────────────────────────────────────────────────────────────
 
@@ -781,14 +1081,22 @@ if __name__ == "__main__":
         "climate_scenario": "reanalysis" if is_cerra else climate_scenario,
         "demand_scenario": demand_scenario,
         "demand_year": demand_year,
+        "demand_model": demand_model,
+        "legacy_thermal": str(legacy_thermal),
         "supply_scenario": supply_scenario_col,
         "supply_year": supply_year,
         "turbine": args.turbine,
         "rolling_window_residual_load": rolling_window_residual_load,
         "use_reservoir_hydro": str(args.use_reservoir_hydro),
-        "reservoir_min_storage_fraction": args.reservoir_min_storage_fraction,
+        "reservoir_min_storage_fraction": str(args.reservoir_min_storage_fraction),
+        "reservoir_efficiency": args.reservoir_efficiency,
         "use_batteries": str(args.use_batteries),
         "use_prosumer_batteries": str(args.use_prosumer_batteries),
+        "flexibility_scheme": args.flexibility_scheme,
+        "battery_dispatch_method": args.battery_dispatch_method,
+        "battery_min_soc_fraction": str(args.battery_min_soc_fraction),
+        "battery_commit_h": args.battery_commit_h,
+        "utility_dispatch_level": args.utility_dispatch_level,
         "battery_duration_h": args.battery_duration_h,
         "battery_roundtrip_eff": args.battery_roundtrip_eff,
         "battery_initial_soc": args.battery_initial_soc,
@@ -812,4 +1120,5 @@ if __name__ == "__main__":
         ds.to_netcdf(path)
         print(f"  Saved: {path}")
 
-    print("\nDone.")
+    t1 = time.time()
+    print(f"\nDone. Time elapsed: {(t1 - t0) / 60:.2f} minutes")
