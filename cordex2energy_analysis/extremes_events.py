@@ -36,6 +36,12 @@ from scipy.ndimage import label as _label
 # ---------------------------------------------------------------------------
 # Standalone event-detection primitives
 # ---------------------------------------------------------------------------
+#: UNITS. Every residual-load and component series these functions receive is ENERGY PER STEP
+#: (GWh per 3-hourly step, as written by scripts/compute_tyndp_projections_extremes.py), not power.
+#: An event's energy is therefore the plain SUM of its per-step excess; the step length converts a
+#: step COUNT to hours (``duration_h``) and nothing else. Multiplying the sum by the step length --
+#: which this module did until 2026-10 -- overstated every severity by 3x.
+STEP_HOURS = 3.0
 
 
 def _detect_events_run_length(
@@ -52,7 +58,7 @@ def _detect_events_run_length(
             "indices": idx,
             "duration_h": float(len(idx) * time_step_h),
             "peak_gw": float(np.max(rl[idx])),
-            "severity_gwh": float(np.sum(np.maximum(rl[idx] - threshold, 0.0)) * time_step_h),
+            "severity_gwh": float(np.sum(np.maximum(rl[idx] - threshold, 0.0))),   # energy per step: sum, no x step
         })
     return events
 
@@ -93,7 +99,7 @@ def _detect_events_spa(
             "duration_h": float(len(idx) * time_step_h),
             "peak_gw": float(np.max(rl[idx])),
             # Gross excess only (non-negative even when event spans dips below threshold)
-            "severity_gwh": float(np.sum(np.maximum(rl[idx] - threshold, 0.0)) * time_step_h),
+            "severity_gwh": float(np.sum(np.maximum(rl[idx] - threshold, 0.0))),   # energy per step: sum, no x step
         })
     return events
 
@@ -112,11 +118,12 @@ def detect_events(
     Parameters
     ----------
     rl :
-        1-D array of residual-load values (GW).
+        1-D array of residual-load values, ENERGY PER STEP (GWh per 3 h step).
     threshold :
-        Exceedance threshold (GW).
+        Exceedance threshold, in the same units as *rl*.
     time_step_h :
-        Length of one time step in hours (default 3 for 3-hourly data).
+        Length of one time step in hours (default 3). Used ONLY to turn a step count into
+        ``duration_h``; severities are plain sums of per-step energy.
     method :
         Detection algorithm:
 
@@ -142,7 +149,8 @@ def detect_events(
         ``peak_gw``
             Maximum residual load during the event (GW).
         ``severity_gwh``
-            Total gross energy above *threshold* during the event (GWh).
+            Total gross energy above *threshold* during the event (GWh): the sum of the per-step
+            excess, with no step-length factor because *rl* is already energy per step.
             Uses ``max(rl - threshold, 0)`` so the value is non-negative
             even when the SPA event spans dips below the threshold.
     """
@@ -297,7 +305,8 @@ def compute_continuous_system_metrics(
 
     Augments *ds_residual_load* with:
 
-    * ``ramping_rate`` — 3-hourly ramping rate (GW/hour).
+    * ``ramping_rate`` — ramping rate in GW per hour. The series is energy per 3 h step, so
+      power is ``rl / 3`` (GW) and its change per hour is ``Δrl / 9``.
     * ``pcit`` — Potential Cross-border Interconnection Transport (GW).
     * ``net_continental_imbalance`` / ``net_system_residual_load``
     * ``anomaly_*`` — demand and generation anomalies relative to the baseline.
@@ -306,7 +315,7 @@ def compute_continuous_system_metrics(
 
     # 1. Ramping rates (GW/hour)
     rl_prev = ds_metrics["residual_load"].shift({time_dim: 1})
-    ds_metrics["ramping_rate"] = (ds_metrics["residual_load"] - rl_prev) / 3.0
+    ds_metrics["ramping_rate"] = (ds_metrics["residual_load"] - rl_prev) / (STEP_HOURS * STEP_HOURS)
     ds_metrics["ramping_rate"] = ds_metrics["ramping_rate"].fillna(0.0)
 
     # 2. PCIT
@@ -521,13 +530,13 @@ def compute_comprehensive_event_metrics(
             "Hydro_RoR_Driven_Share_%": round(float(hydro_share), 1),
             "Reservoir_Hydro_Driven_Share_%": round(float(reservoir_share), 1),
             "Battery_Driven_Share_%": round(float(battery_share), 1),
-            "Avg_Demand_Anomaly_GWh": round(float(tot_d_anom * 3 / num_features), 2),
-            "Avg_PV_Anomaly_GWh": round(-float(tot_pv_anom * 3 / num_features), 2),
-            "Avg_Wind_Onshore_Anomaly_GWh": round(-float(tot_w_anom * 3 / num_features), 2),
-            "Avg_Wind_Offshore_Anomaly_GWh": round(-float(tot_woff_anom * 3 / num_features), 2),
-            "Avg_Hydro_RoR_Anomaly_GWh": round(-float(tot_hydro_anom * 3 / num_features), 2),
-            "Avg_Reservoir_Anomaly_GWh": round(-float(tot_reservoir_anom * 3 / num_features), 2),
-            "Avg_Battery_Anomaly_GWh": round(-float(tot_battery_anom * 3 / num_features), 2),
+            "Avg_Demand_Anomaly_GWh": round(float(tot_d_anom / num_features), 2),
+            "Avg_PV_Anomaly_GWh": round(-float(tot_pv_anom / num_features), 2),
+            "Avg_Wind_Onshore_Anomaly_GWh": round(-float(tot_w_anom / num_features), 2),
+            "Avg_Wind_Offshore_Anomaly_GWh": round(-float(tot_woff_anom / num_features), 2),
+            "Avg_Hydro_RoR_Anomaly_GWh": round(-float(tot_hydro_anom / num_features), 2),
+            "Avg_Reservoir_Anomaly_GWh": round(-float(tot_reservoir_anom / num_features), 2),
+            "Avg_Battery_Anomaly_GWh": round(-float(tot_battery_anom / num_features), 2),
         }
 
     return metrics_summary
@@ -687,13 +696,13 @@ def compute_seasonal_evt_metrics(
                 "Wind_Onshore_Driven_Share_%": won_sh, "Wind_Offshore_Driven_Share_%": woff_sh,
                 "Hydro_RoR_Driven_Share_%": hror_sh, "Reservoir_Hydro_Driven_Share_%": res_sh,
                 "Battery_Driven_Share_%": bat_sh,
-                "Avg_Demand_Anomaly_GWh": round( tot_d   * 3 / n_ev, 2),
-                "Avg_PV_Anomaly_GWh":     round(-tot_pv  * 3 / n_ev, 2),
-                "Avg_Wind_Onshore_Anomaly_GWh":  round(-tot_won  * 3 / n_ev, 2),
-                "Avg_Wind_Offshore_Anomaly_GWh": round(-tot_woff * 3 / n_ev, 2),
-                "Avg_Hydro_RoR_Anomaly_GWh":     round(-tot_hror * 3 / n_ev, 2),
-                "Avg_Reservoir_Anomaly_GWh":     round(-tot_res  * 3 / n_ev, 2),
-                "Avg_Battery_Anomaly_GWh":       round(-tot_bat  * 3 / n_ev, 2),
+                "Avg_Demand_Anomaly_GWh": round( tot_d   / n_ev, 2),
+                "Avg_PV_Anomaly_GWh":     round(-tot_pv  / n_ev, 2),
+                "Avg_Wind_Onshore_Anomaly_GWh":  round(-tot_won  / n_ev, 2),
+                "Avg_Wind_Offshore_Anomaly_GWh": round(-tot_woff / n_ev, 2),
+                "Avg_Hydro_RoR_Anomaly_GWh":     round(-tot_hror / n_ev, 2),
+                "Avg_Reservoir_Anomaly_GWh":     round(-tot_res  / n_ev, 2),
+                "Avg_Battery_Anomaly_GWh":       round(-tot_bat  / n_ev, 2),
             })
 
     return rows

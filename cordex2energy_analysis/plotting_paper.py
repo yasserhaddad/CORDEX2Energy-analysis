@@ -24,8 +24,12 @@ These are load-bearing — the paper's uncertainty language depends on them bein
   (``show_points``) and are kept where the ensemble spread is itself the message (Fig 2b); they are
   turned off in the regime figures, where 6 zones × 3 levels × 9 chains would be 162 dots.  Per-chain
   robustness is reported regardless — as the ``n/9`` agreement counts on the figures, and in S8/S14.
-* **``set_aspect("auto")`` after any geopandas draw.**  ``GeoDataFrame.plot`` forces
-  ``aspect="equal"``, which shrinks the maps inside their axes and leaves large white gutters.
+* **Maps are drawn in ETRS89-LAEA (EPSG:3035) at equal aspect** when the geometry is loaded with
+  ``crs=MAP_CRS``: the EU's official equal-area projection, so a country's drawn area is its true
+  area. The older lon/lat drawing, still used by the legacy working notebooks, forced
+  ``set_aspect("auto")`` to fill its panel box, which stretched the map by whatever that box's
+  shape was and inflated the north (a degree of longitude is 0.64 of a degree of latitude at 50 N).
+  :func:`map_extent` and :func:`set_map_aspect` pick the right behaviour from the geometry's CRS.
 * **A percentage change is only plotted where the baseline is meaningful** (see
   ``min_baseline_fraction``): a ratio taken off a near-zero base is noise and would hijack the
   colour scale.
@@ -51,11 +55,11 @@ from .extremes_analysis import (
     compute_exceedance_survival,
     compute_survival_x_grid,
 )
-from .plotting_extremes import SPREAD_LABEL, spread_qpair
+from .plotting_extremes import SPREAD_LABEL, model_spread_bounds, spread_qpair, whis_for
 
 __all__ = [
     "PaperStyle",
-    "MAP_EXTENT",
+    "MAP_EXTENT", "MAP_CRS", "MAP_EXTENT_LAEA", "map_extent", "set_map_aspect", "is_projected",
     "RIVER_CMAP",
     "load_country_geometry",
     "plot_country_choropleth",
@@ -105,7 +109,7 @@ class PaperStyle:
     season_order: Sequence[str]
     n_models: int
     robustness_threshold: int               # e.g. 6 of 9 chains must agree on the sign
-    spread: str = "iqr"                     # "iqr" (P25-P75) | "minmax"
+    spread: str = "iqr"                     # "iqr" (P25-P75) | "minmax" | "tukey" (1.5xIQR)
 
     @property
     def reference_period(self) -> str:
@@ -142,13 +146,42 @@ def _change_color(pct: float) -> str:
 # ---------------------------------------------------------------------------
 MAP_EXTENT = (-12, 40, 33, 72)          # lon_min, lon_max, lat_min, lat_max
 
+#: The publication maps' projection: ETRS89 Lambert azimuthal equal-area, as used by Eurostat, the
+#: EEA and INSPIRE for pan-European statistical maps.
+MAP_CRS = "EPSG:3035"
+#: Its extent, in metres. The study's 37 countries span x 2636-6501 km, y 1430-5423 km. The box
+#: leaves ~160 km of sea west of Portugal, takes in all of Lebanon east of Cyprus (to 6745 km), and
+#: drops to 1300 km so Crete (south tip 1423 km) has sea below it. All of it stays inside the
+#: climate grid's footprint (its west edge reaches x = 2437 km at Portugal's latitude, its east edge
+#: ~6960 km and its south edge ~930 km in the eastern Mediterranean), so gridded maps fill it too.
+MAP_EXTENT_LAEA = (2480e3, 6800e3, 1300e3, 5470e3)
+#: Generous lon/lat window the geometry is clipped to BEFORE projecting: an azimuthal projection
+#: blows up toward its antipode, so the far east of Russia and overseas territories must not be
+#: carried into it.
+_PROJECTION_WINDOW = (-30, 60, 25, 76)
+
+
+def is_projected(countries) -> bool:
+    return countries.crs is not None and countries.crs.is_projected
+
+
+def map_extent(countries):
+    """(x0, x1, y0, y1) of the map in the geometry's own coordinates."""
+    return MAP_EXTENT_LAEA if is_projected(countries) else MAP_EXTENT
+
+
+def set_map_aspect(ax, countries) -> None:
+    """Equal aspect on a projected map (the point of an equal-area projection); the legacy
+    lon/lat maps keep "auto". Call after EVERY geopandas draw, which resets it to "equal"."""
+    ax.set_aspect("equal" if is_projected(countries) else "auto")
+
 #: Blue ramp used for hydro, matching ``CMAPS`` in :mod:`cordex2energy_analysis.plotting`.
 RIVER_CMAP = mcolors.LinearSegmentedColormap.from_list(
     "river", ["#1c4e80", "#4ea3c8", "#cfe9f2", "#ffffff"]
 )
 
 
-def load_country_geometry(natural_earth_geojson) -> gpd.GeoDataFrame:
+def load_country_geometry(natural_earth_geojson, crs=None) -> gpd.GeoDataFrame:
     """Country polygons for the choropleths, keyed by the ISO2 code the energy data uses.
 
     Natural Earth (not NUTS): NUTS dropped the UK after Brexit and omits non-NUTS states, which
@@ -158,15 +191,28 @@ def load_country_geometry(natural_earth_geojson) -> gpd.GeoDataFrame:
     Two coding quirks are handled here: ``ISO_A2`` is ``"-99"`` for several countries (France,
     Norway, Kosovo) and falls back to ``ISO_A2_EH``; and Natural Earth codes the United Kingdom
     ``"GB"`` while the c2e data uses ``"UK"``.
+
+    ``crs=MAP_CRS`` returns the geometry clipped to a generous European window and projected; the
+    default keeps the legacy lon/lat geometry.
     """
     ne = gpd.read_file(natural_earth_geojson)
     iso2 = ne["ISO_A2"].where(ne["ISO_A2"] != "-99", ne["ISO_A2_EH"]).replace({"GB": "UK"})
-    return (
+    # Northern Cyprus is a separate admin-0 unit in Natural Earth with ISO "-99" in BOTH code
+    # fields, so it dissolved into an anonymous "-99" blob and was drawn grey beside a coloured
+    # south. The study treats Cyprus as one country, so the two are merged here.
+    iso2 = iso2.where(ne["ADM0_A3"] != "CYN", "CY")
+    countries = (
         ne.assign(ISO2=iso2)[["ISO2", "geometry"]]
         .dissolve(by="ISO2")
         .reset_index()
         .cx[MAP_EXTENT[0]:MAP_EXTENT[1], MAP_EXTENT[2]:MAP_EXTENT[3]]
     )
+    if crs is None:
+        return countries
+    from shapely.geometry import box
+    clipped = countries.clip(box(_PROJECTION_WINDOW[0], _PROJECTION_WINDOW[2],
+                                 _PROJECTION_WINDOW[1], _PROJECTION_WINDOW[3]))
+    return clipped[~clipped.geometry.is_empty].to_crs(crs).reset_index(drop=True)
 
 
 def plot_country_choropleth(
@@ -178,16 +224,30 @@ def plot_country_choropleth(
     vcenter: float | None = None,
     vmin: float | None = None,
     vmax: float | None = None,
+    norm=None,
     clabel: str = "",
     extend: str = "neither",
     legend: bool = True,
+    edgecolor: str = "white",
+    linewidth: float = 0.3,
 ):
-    """Draw one country choropleth; countries without a value are greyed, not dropped."""
+    """Draw one country choropleth; countries without a value are greyed, not dropped.
+
+    ``norm`` takes precedence over ``vcenter``/``vmin``/``vmax`` when given — that is how a
+    discrete :class:`~matplotlib.colors.BoundaryNorm` is passed in for a binned scale.
+
+    ``edgecolor``/``linewidth`` default to today's white hairline.  A darker border is needed on a
+    binned scale whose neutral class is near-white (``NEUTRAL_CLASS_COLOR``): white borders on an
+    almost-white fill make adjacent countries indistinguishable exactly where the map is saying
+    "nothing happens here".
+    """
     values = values_by_iso2.rename("val").rename_axis("ISO2").reset_index()
     merged = countries.merge(values, on="ISO2", how="left")
 
     kw = dict(vmin=vmin, vmax=vmax)
-    if vcenter is not None:
+    if norm is not None:
+        kw = dict(norm=norm)
+    elif vcenter is not None:
         lo = vmin if vmin is not None else float(np.nanmin(merged["val"]))
         hi = vmax if vmax is not None else float(np.nanmax(merged["val"]))
         kw = dict(norm=mcolors.TwoSlopeNorm(vcenter=vcenter,
@@ -196,20 +256,30 @@ def plot_country_choropleth(
     merged.plot(column="val", cmap=cmap, legend=legend, ax=ax,
                 legend_kwds={"label": clabel, "shrink": 0.72, "extend": extend},
                 missing_kwds={"color": "lightgrey"},
-                edgecolor="white", linewidth=0.3, **kw)
-    ax.set_xlim(MAP_EXTENT[0], MAP_EXTENT[1])
-    ax.set_ylim(MAP_EXTENT[2], MAP_EXTENT[3])
+                edgecolor=edgecolor, linewidth=linewidth, **kw)
+    x0, x1, y0, y1 = map_extent(countries)
+    ax.set_xlim(x0, x1)
+    ax.set_ylim(y0, y1)
     ax.set_axis_off()
-    ax.set_aspect("auto")           # geopandas forces "equal", which squeezes the map (see docstring)
+    set_map_aspect(ax, countries)   # geopandas resets the aspect on every draw (see docstring)
     return ax
 
 
-def _hatch_disagreeing_countries(ax, agreement, field, countries, style: PaperStyle) -> None:
-    """Hatch countries where fewer than ``style.robustness_threshold`` chains agree on the sign."""
+def _hatch_disagreeing_countries(ax, agreement, field, countries, style: PaperStyle,
+                                 min_magnitude: float | None = None) -> None:
+    """Hatch countries where fewer than ``style.robustness_threshold`` chains agree on the sign.
+
+    ``min_magnitude`` suppresses the hatch where ``|value|`` is below it.  Sign agreement on a
+    negligible change is not informative — if a country moves by 0.3 % the chains will disagree on
+    the sign roughly at random, and hatching it says "uncertain" when the truthful statement is
+    "flat".  Measured on Figure 1, *every* hatched solar country and 9 of 11 hatched wind countries
+    were of this kind, which is what made the hatching read as noise.
+    """
     isos = [
         str(country)
         for country, n_agree, value in zip(agreement["country"].values, agreement.values, field.values)
         if n_agree < style.robustness_threshold and np.isfinite(value)
+        and (min_magnitude is None or abs(value) >= min_magnitude)
     ]
     if isos:
         countries[countries["ISO2"].isin(isos)].plot(
@@ -220,6 +290,57 @@ def _symmetric_limit(values, clip_percentile: float) -> float:
     """Robust symmetric colour limit; the extend arrows carry whatever lies beyond it."""
     finite = np.abs(values.values[np.isfinite(values.values)])
     return max(float(np.nanpercentile(finite, clip_percentile)), 1e-6) if finite.size else 1.0
+
+
+#: Colour of the "no material change" class on a binned change scale.  Deliberately the RdBu/RdBu_r
+#: midpoint rather than a grey: near-zero already renders as this colour on the continuous scale, so
+#: binning only makes it an explicit, labelled class — and it stays distinguishable from the
+#: ``lightgrey`` used for countries with no data at all.
+NEUTRAL_CLASS_COLOR = "#f7f7f7"
+
+
+def _zero_class(edges: Sequence[float]) -> tuple[float, float]:
+    """The (low, high) edges of the bin containing zero — the "no material change" class."""
+    index = int(np.searchsorted(edges, 0.0, side="right")) - 1
+    if not 0 <= index < len(edges) - 1:
+        raise ValueError(f"change bin edges must straddle zero; got {list(edges)}")
+    return float(edges[index]), float(edges[index + 1])
+
+
+def _binned_norm(edges: Sequence[float], cmap_name: str, *, by: str = "midpoint"):
+    """A discrete (BoundaryNorm, ListedColormap) pair for a set of change-bin edges.
+
+    ``by="midpoint"`` (default) samples each bin's colour at its **midpoint** on a symmetric scale
+    rather than by bin index, so an asymmetric edge set (cooling runs +1 → +200 % with nothing
+    below) still maps magnitude to colour intensity sensibly.
+
+    ``by="rank"`` samples by each bin's ORDINAL distance from the zero class, both sides normalised
+    by the longer side. For a geometric edge set spanning two orders of magnitude (Figure 3b runs
+    -1 to +8 events per year, most cells inside +/-0.25) midpoint sampling washes every small class
+    out to near-white; rank sampling keeps each class a distinct step, and a side with fewer classes
+    simply never reaches the darkest shade.
+
+    The bin containing zero is overridden to :data:`NEUTRAL_CLASS_COLOR`, and the under/over colours
+    carry the extend arrows.
+    """
+    edges = [float(e) for e in edges]
+    base = plt.get_cmap(cmap_name)
+    mids = [0.5 * (lo + hi) for lo, hi in zip(edges[:-1], edges[1:])]
+    if by == "rank":
+        zero = next(i for i, (lo, hi) in enumerate(zip(edges[:-1], edges[1:])) if lo <= 0.0 <= hi)
+        depth = max(zero, len(mids) - 1 - zero) or 1
+        colors = [base(0.5 * (1.0 + (i - zero) / depth)) for i in range(len(mids))]
+    else:
+        span = max(abs(edges[0]), abs(edges[-1])) or 1.0
+        colors = [base(0.5 * (1.0 + np.clip(m / span, -1.0, 1.0))) for m in mids]
+
+    low, high = _zero_class(edges)
+    colors[edges.index(low)] = mcolors.to_rgba(NEUTRAL_CLASS_COLOR)
+
+    discrete = mcolors.ListedColormap(colors)
+    discrete.set_under(base(0.0))
+    discrete.set_over(base(1.0))
+    return mcolors.BoundaryNorm(edges, discrete.N), discrete
 
 
 def _baseline_relevance_mask(reference, min_baseline_fraction: float):
@@ -250,7 +371,7 @@ def panel_event_frequency(ax, events: pd.DataFrame, duration_class: str, style: 
     figure-level warming-level legend instead (a per-axes one lands on the British Isles boxes, which
     hug the bottom of the axis).
     """
-    qlo, qhi = style.spread_percentiles
+    whis = whis_for(style.spread)
     data = events[events.duration_class == duration_class]
     width, positions = 0.26, np.arange(len(style.zones))
 
@@ -259,7 +380,7 @@ def panel_event_frequency(ax, events: pd.DataFrame, duration_class: str, style: 
         per_zone = [data[(data.zone == z) & (data.period == period)]["freq_per_year"].values
                     for z in style.zones]
         boxes = ax.boxplot(per_zone, positions=positions + offset, widths=width * 0.86,
-                           patch_artist=True, showfliers=False, whis=(qlo, qhi),
+                           patch_artist=True, showfliers=False, whis=whis,
                            medianprops=dict(color="black", lw=1.3))
         for box in boxes["boxes"]:
             box.set_facecolor(style.gwl_colors[period])
@@ -307,7 +428,6 @@ def panel_driver_attribution(ax, attribution: Callable[[str, str], pd.DataFrame]
 
     On the deliberate absence of error bars on the segments, see the module docstring.
     """
-    qlo, qhi = style.spread_percentiles
     width = 0.8 / len(seasons)
     positions = np.arange(len(style.zones))
 
@@ -337,8 +457,9 @@ def panel_driver_attribution(ax, attribution: Callable[[str, str], pd.DataFrame]
                     bottom += value
 
             net = per_chain["net"]
-            spread = ([[net.median() - net.quantile(qlo / 100)],
-                       [net.quantile(qhi / 100) - net.median()]] if show_net_spread else None)
+            low, high = model_spread_bounds(net.values, style.spread, axis=0)
+            spread = ([[net.median() - low], [high - net.median()]]
+                      if show_net_spread else None)
             ax.errorbar(i + offset, net.median(), yerr=spread,
                         fmt="D", ms=4.5, color="black", ecolor="black",
                         elinewidth=1.1, capsize=2.5, zorder=6)
@@ -363,27 +484,34 @@ def panel_driver_attribution(ax, attribution: Callable[[str, str], pd.DataFrame]
     ax.add_artist(season_key)          # keep it when the driver legend is added afterwards
 
 
-def _annotate_sign_convention(ax) -> None:
+def _annotate_sign_convention(ax, *, arrow_x: float = -0.115, label_x: float = -0.155,
+                              labels=("deepens the deficit", "eases the deficit")) -> None:
     """Two arrows outside the y-axis saying what the sign of the change means.
 
     This belongs on the axis, not smuggled into the y-label.  Drawn outside the axes with
     ``clip_on=False``; the figures are saved with ``bbox_inches="tight"``, which expands the canvas
     to include them.
+
+    ``arrow_x`` and ``label_x`` are axes fractions, so the same defaults put the arrows three times
+    further from a full-width panel than from a half-width one.  Callers that draw at more than one
+    width pass fractions computed from the axes' own size, which is what keeps the gutter a fixed
+    number of millimetres instead of a fixed proportion.
     """
     for y_from, y_to, y_text, label, color in [
-        (0.56, 0.98, 0.77, "deepens the deficit", UP_COLOR),
-        (0.44, 0.02, 0.23, "eases the deficit", DOWN_COLOR),
+        (0.56, 0.98, 0.77, labels[0], UP_COLOR),
+        (0.44, 0.02, 0.23, labels[1], DOWN_COLOR),
     ]:
-        ax.annotate("", xy=(-0.115, y_to), xytext=(-0.115, y_from), xycoords="axes fraction",
+        ax.annotate("", xy=(arrow_x, y_to), xytext=(arrow_x, y_from), xycoords="axes fraction",
                     arrowprops=dict(arrowstyle="-|>", color=color, lw=1.3),
                     annotation_clip=False)
-        ax.text(-0.155, y_text, label, transform=ax.transAxes, rotation=90,
+        ax.text(label_x, y_text, label, transform=ax.transAxes, rotation=90,
                 va="center", ha="center", fontsize=7.5, color=color, clip_on=False)
 
 
 def panel_storage_attenuation(ax, attenuation: pd.DataFrame, events: pd.DataFrame,
                               duration_class: str, style: PaperStyle, *,
-                              show_points: bool = False) -> None:
+                              show_points: bool = False,
+                              show_frequency_change: bool = False) -> None:
     """Severity absorbed by storage: the two Shapley shares and their total, annotated with the
     change in event frequency.
 
@@ -398,7 +526,7 @@ def panel_storage_attenuation(ax, attenuation: pd.DataFrame, events: pd.DataFram
     Pairing the attenuation with the change in event *frequency* is the point of the panel: storage
     can absorb most of the severity and still not prevent the exceedances.
     """
-    qlo, qhi = style.spread_percentiles
+    whis = whis_for(style.spread)
     warm = attenuation[(attenuation.duration_class == duration_class)
                        & (attenuation.period == style.warmest_period)]
     frequency = events[events.duration_class == duration_class]
@@ -416,7 +544,7 @@ def panel_storage_attenuation(ax, attenuation: pd.DataFrame, events: pd.DataFram
             if not len(values):
                 continue
             boxes = ax.boxplot([values], positions=[position], widths=width * 0.86,
-                               patch_artist=True, showfliers=False, whis=(qlo, qhi),
+                               patch_artist=True, showfliers=False, whis=whis,
                                medianprops=dict(color="black", lw=1.2))
             for box in boxes["boxes"]:
                 box.set_facecolor(color)
@@ -427,20 +555,21 @@ def panel_storage_attenuation(ax, attenuation: pd.DataFrame, events: pd.DataFram
                 ax.plot(np.full(len(values), position), values, "o", ms=2.2, color="0.15",
                         alpha=0.5, zorder=5)
 
-        ref = frequency[(frequency.zone == zone)
-                        & (frequency.period == style.reference_period)]["freq_per_year"].median()
-        hot = frequency[(frequency.zone == zone)
-                        & (frequency.period == style.warmest_period)]["freq_per_year"].median()
-        if ref > 0:
-            pct = 100 * (hot - ref) / ref
-            ax.annotate(f"{pct:+.0f}%", xy=(i, 116), ha="center", va="top", fontsize=9,
-                        fontweight="bold", color=_change_color(pct))
+        if show_frequency_change:
+            ref = frequency[(frequency.zone == zone)
+                            & (frequency.period == style.reference_period)]["freq_per_year"].median()
+            hot = frequency[(frequency.zone == zone)
+                            & (frequency.period == style.warmest_period)]["freq_per_year"].median()
+            if ref > 0:
+                pct = 100 * (hot - ref) / ref
+                ax.annotate(f"{pct:+.0f}%", xy=(i, 116), ha="center", va="top", fontsize=9,
+                            fontweight="bold", color=_change_color(pct))
 
     ax.set_xticks(positions)
     ax.set_xticklabels(style.labels(), fontsize=8, rotation=18)
     ax.set_ylabel("severity absorbed by storage (%)\nShapley shares", fontsize=9)
     ax.set_xlim(-0.5, len(style.zones) - 0.5)
-    ax.set_ylim(0, 122)
+    ax.set_ylim(0, 122 if show_frequency_change else 105)
     ax.legend(handles=[plt.Rectangle((0, 0), 1, 1, color=color, alpha=0.8) for _, _, color in parts],
               labels=[label for _, label, _ in parts],
               fontsize=7.5, frameon=False, loc="lower left", ncol=3)
@@ -459,6 +588,9 @@ def plot_mean_state_maps(
     clip_percentile: float = 98,
     min_baseline_fraction: float = 0.02,
     unit: str = "TWh yr$^{-1}$",
+    change_bins: Mapping[str, Sequence[float]] | None = None,
+    absolute_change_rows: Sequence[str] = (),
+    change_clabels: Mapping[str, str] | None = None,
     title: str = "Figure 1 · The mean state improves across warming levels",
 ) -> Figure:
     """Country maps: one row per energy variable, one column per warming level.
@@ -466,8 +598,23 @@ def plot_mean_state_maps(
     ``quantities`` is a sequence of ``(row_label, field(period) -> DataArray(model, country),
     cmap, absolute_center)``.  ``absolute_center=0`` gives the first column a diverging, zero-centred
     scale (used for residual load, which changes sign between countries); ``None`` gives a sequential
-    one.  Columns 2+ are the % change vs the reference period, sharing one colorbar per row because
+    one.  Columns 2+ are the change vs the reference period, sharing one colorbar per row because
     each variable needs its own scale (heating ≈ −30 % while cooling runs into the hundreds).
+
+    ``change_bins`` maps a row label to **fixed** bin edges for its change columns.  Without it the
+    scale is continuous and auto-zoomed to ``clip_percentile`` of the row's own values, which
+    misrepresents a row that carries no signal: solar moves by under 2 % in every country, so
+    auto-zooming stretches pure noise across the full ramp and the map reads as structure.  Fixed
+    edges say "flat" honestly, and the class containing zero is drawn in the colormap's own midpoint
+    and labelled as no material change.
+
+    ``absolute_change_rows`` names rows whose change columns are a **difference in the row's unit**
+    rather than a percentage.  This is required for any quantity that changes sign between countries:
+    residual load is negative wherever a country is in surplus, so dividing by it inverts the
+    percentage — the United Kingdom tightens by +14.6 TWh yr⁻¹ off a −67.9 TWh yr⁻¹ base and reports
+    as −18.7 %, rendering blue while it is the most tightening country in Europe.  A difference has
+    no denominator, so the sign is always physical.  Such rows keep their own diverging colormap
+    (so their change columns agree in direction with their column 0) and are never baseline-masked.
     """
     fig, axes = plt.subplots(len(quantities), len(style.period_names), figsize=(11.0, 15.5),
                              squeeze=False, constrained_layout=True)
@@ -487,11 +634,17 @@ def plot_mean_state_maps(
                                     cmap=cmap, vcenter=absolute_center, vmin=-limit, vmax=limit,
                                     clabel=unit, extend="both", legend=True)
 
-        # columns 1+ — % change, greyed where the baseline is too small to divide by
-        baseline_ok = _baseline_relevance_mask(reference, min_baseline_fraction)
+        # columns 1+ — the change vs the reference level
+        absolute = name in absolute_change_rows
+        edges = list((change_bins or {}).get(name, ())) or None
+
+        # A difference has no denominator, so nothing needs greying; a ratio does.
+        baseline_ok = None if absolute else _baseline_relevance_mask(reference,
+                                                                     min_baseline_fraction)
         changes, agreements = [], []
         for period in style.period_names[1:]:
-            per_chain = 100 * (field(period) - reference_per_chain) / reference_per_chain
+            delta = field(period) - reference_per_chain
+            per_chain = delta if absolute else 100 * delta / reference_per_chain
             per_chain = per_chain.where(np.isfinite(per_chain))
             change = per_chain.median("model")
             if baseline_ok is not None:
@@ -499,23 +652,44 @@ def plot_mean_state_maps(
             changes.append(change)
             agreements.append(sign_agreement(per_chain, model_dim="model"))
 
-        limit = max(_symmetric_limit(c, clip_percentile) for c in changes)
-        data_max = max(float(np.nanmax(np.abs(c.values))) for c in changes)
-        extend = "both" if data_max > limit * 1.0001 else "neither"
+        # An absolute-change row keeps its own diverging colormap so its change columns agree
+        # in direction with its column 0 — which means its bar can run the OTHER way round
+        # from the percentage rows.  `change_clabels` is how that gets said out loud.
+        change_cmap = cmap if absolute else "RdBu"
+        clabel = (change_clabels or {}).get(
+            name, f"change ({unit})" if absolute else "% change")
+
+        if edges is not None:
+            norm, discrete_cmap = _binned_norm(edges, change_cmap)
+            # Hatching is suppressed inside the class containing zero — see
+            # `_hatch_disagreeing_countries`.
+            neutral = max(abs(e) for e in _zero_class(edges))
+            per_col_kw = dict(norm=norm, cmap=discrete_cmap)
+            bar_kw = dict(mappable=plt.cm.ScalarMappable(norm=norm, cmap=discrete_cmap),
+                          extend="both", ticks=edges, spacing="uniform")
+        else:
+            limit = max(_symmetric_limit(c, clip_percentile) for c in changes)
+            data_max = max(float(np.nanmax(np.abs(c.values))) for c in changes)
+            neutral = None
+            per_col_kw = dict(cmap=change_cmap, vcenter=0, vmin=-limit, vmax=limit)
+            bar_kw = dict(mappable=plt.cm.ScalarMappable(
+                              norm=mcolors.TwoSlopeNorm(vcenter=0, vmin=-limit, vmax=limit),
+                              cmap=change_cmap),
+                          extend="both" if data_max > limit * 1.0001 else "neither")
 
         for col, (change, agreement) in enumerate(zip(changes, agreements), start=1):
             ax = axes[row, col]
             plot_country_choropleth(ax, change.to_series().dropna(), countries,
-                                    cmap="RdBu", vcenter=0, vmin=-limit, vmax=limit, legend=False)
-            _hatch_disagreeing_countries(ax, agreement, change, countries, style)
-            ax.set_aspect("auto")      # the hatch layer is another geopandas draw -> resets to "equal"
+                                    legend=False, **per_col_kw)
+            _hatch_disagreeing_countries(ax, agreement, change, countries, style,
+                                         min_magnitude=neutral)
+            set_map_aspect(ax, countries)   # the hatch layer is another geopandas draw
 
-        mappable = plt.cm.ScalarMappable(
-            norm=mcolors.TwoSlopeNorm(vcenter=0, vmin=-limit, vmax=limit), cmap="RdBu")
+        mappable = bar_kw.pop("mappable")
         mappable.set_array([])
         bar = fig.colorbar(mappable, ax=[axes[row, c] for c in range(1, len(style.period_names))],
-                           fraction=0.025, pad=0.01, extend=extend)
-        bar.set_label("% change", fontsize=8)
+                           fraction=0.025, pad=0.01, **bar_kw)
+        bar.set_label(clabel, fontsize=8)
         bar.ax.tick_params(labelsize=7)
 
         # row label: the map axes are switched off, so re-enable just enough to carry the ylabel
@@ -560,7 +734,7 @@ def plot_tail_survival(
     threshold sits at the same place in both, and a season whose distribution stops short of that
     line is visibly a season with no exceedance — which is why no annotation says so.
     """
-    q_low, q_high = style.spread_percentiles
+    whis = whis_for(style.spread)
     fig = plt.figure(figsize=(16.5, 8.4))
     grid = gridspec.GridSpec(3, len(style.zones), height_ratios=[1, 1, 0.8],
                              hspace=0.35, wspace=0.3)
@@ -637,7 +811,7 @@ def plot_tail_survival(
             position = i + (k - 1) * width
             values = totals[totals.period == period][column].values
             boxes = ax_budget.boxplot([values], positions=[position], widths=width * 0.85,
-                                      patch_artist=True, showfliers=False, whis=(q_low, q_high),
+                                      patch_artist=True, showfliers=False, whis=whis,
                                       medianprops=dict(color="black", lw=1.3))
             for box in boxes["boxes"]:
                 box.set_facecolor(style.gwl_colors[period])
@@ -691,7 +865,6 @@ def plot_sub_daily_regime(
     title: str = "Figure 3 · The sub-daily regime — short evening deficits surge in Southern Europe",
 ) -> Figure:
     """what changes → why they are short → why they grow → can flexibility stop it."""
-    qlo, qhi = style.spread_percentiles
     fig, axes = plt.subplots(2, 2, figsize=(14.5, 9.6))
 
     panel_event_frequency(axes[0, 0], events, "sub_daily", style, "sub-daily events per year",
@@ -708,8 +881,7 @@ def plot_sub_daily_regime(
         ax_diurnal.plot(hours, profiles.median(axis=1), color=style.gwl_colors[period], lw=2.0,
                         label=period, zorder=3)
         ax_diurnal.fill_between(hours,
-                                np.percentile(profiles.values, qlo, axis=1),
-                                np.percentile(profiles.values, qhi, axis=1),
+                                *model_spread_bounds(profiles.values, style.spread, axis=1),
                                 color=style.gwl_colors[period], alpha=0.16, lw=0, zorder=2)
     ax_diurnal.axhspan(1.0, ax_diurnal.get_ylim()[1], color="0.9", alpha=0.0)
     ax_diurnal.axhline(1.0, color="0.25", ls="--", lw=1.2, zorder=4)

@@ -28,8 +28,26 @@ demand_model="cordex2energy_demand"
 # handling (no baseload modulation) for validation.
 legacy_thermal=false
 
-supply_scenario="LOW"
-# supply_scenario="HIGH"
+# ── Cooling target ────────────────────────────────────────────────────────────
+# rescale_cooling=false (the paper's setting) leaves cooling at the level the demand model derives
+# and passes --no-cooling-target, writing to a '_freecool' run tag. Heating stays pinned to its own
+# TYNDP target and the baseload is unchanged.
+#
+# The asymmetry is empirical, not a preference. Comparing each TYNDP target with the JRC-IDEES
+# series the model is actually fitted to, in the same base year (2019):
+#   heating  TYNDP/JRC = 1.04x median (1.08x aggregate), scattered — 6 of 12 countries below 1
+#   cooling  TYNDP/JRC = 2.03x median (1.71x aggregate), biased  — 10 of 12 above 1
+# TYNDP's 'Cooling' is systematically broader than the space cooling the model fits, and its
+# Italy/Spain ordering is inverted relative to every observed year. Because k multiplies the whole
+# series it amplifies the climate TREND by the same factor, so k_cool = 3.55 for Italy drove the
+# South-East zone into threshold saturation (43.7 % of JJA timesteps at +3.0 C). See
+# notebooks/paper_metric_and_target_diagnostics.ipynb.
+#
+# Set rescale_cooling=true for the upper-bracket sensitivity (cooling pinned to the TYNDP target).
+rescale_cooling=false
+
+# supply_scenario="LOW"
+supply_scenario="HIGH"
 supply_year=2050
 # supply_year=2040
 # rolling_window_residual_load=8
@@ -120,10 +138,13 @@ if [ "$use_batteries" = true ]; then
     fi
 fi
 
-# ── Demand-model args (model selector + optional legacy-thermal flag) ─────────
+# ── Demand-model args (model selector, legacy-thermal and cooling-target flags) ─
 demand_args=(--demand_model "$demand_model")
 if [ "$legacy_thermal" = "true" ]; then
     demand_args+=(--legacy_thermal)
+fi
+if [ "$rescale_cooling" = "false" ]; then
+    demand_args+=(--no-cooling-target)
 fi
 
 for model in "${models[@]}"; do

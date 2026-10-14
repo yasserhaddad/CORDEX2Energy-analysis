@@ -12,6 +12,26 @@ projection scenario (LOW/BE/HIGH) with an associated target year, this script:
 5. Computes estimated generation for all technologies.
 6. Computes the residual load and its generation/demand components.
 7. Saves the residual load and components as NetCDF files.
+
+Two properties of the volumetric rescaling in step 6 are worth knowing before interpreting a run,
+because both are counter-intuitive and both have been measured:
+
+**The rescaling cancels any per-country constant applied upstream.** ``k = target / E_simulated``
+is computed from the same series it multiplies, so a constant factor ``c`` on a country's demand
+rescales ``k`` by ``1/c`` and leaves the product identical. In particular the cooling model's
+``corrective_ratio_cool`` (the JRC anchoring, M7 vs M7r) is exactly such a constant — verified flat
+to 3.6e-07 across 262 968 hours — so **M7 and M7r produce the identical residual-load system** in
+any target-rescaled run, and the anchoring choice cannot be inferred from the output. Under
+``--no-cooling-target`` ``k_cool = 1``, the cancellation stops, and the run is explicitly an M7
+(anchored) run because it reads the default anchored demand product. ``--no-ac-growth`` is a shape
+change, not a constant (its ratio varies by 1.658 within a country), so it never cancels.
+
+**``k`` scales the climate trend, not just the level.** It multiplies the whole series, so a
+country's projected growth is amplified by its own ``k``. ``k_cool`` spans ~8x across Europe
+(Italy 3.55, Spain 0.87) and inverts the model's Spain>Italy ordering, which is the dominant
+control on the projected southern summer deficit. The realised ``k_heat``/``k_cool`` table is
+printed on every run for this reason. See
+``CORDEX2Energy-analysis/notebooks/paper_metric_and_target_diagnostics.ipynb`` for the evidence.
 """
 
 import argparse
@@ -21,6 +41,7 @@ import os
 from pathlib import Path
 
 import dask
+import numpy as np
 import pandas as pd
 import xarray as xr
 
@@ -390,6 +411,21 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--no-cooling-target",
+        dest="rescale_cooling",
+        action="store_false",
+        default=True,
+        help=(
+            "Do not rescale cooling to its TYNDP annual target (k_cool = 1), keeping the "
+            "physically derived cooling level from the demand model. Heating stays pinned to its "
+            "own target and the baseload is unchanged, so this isolates the effect of the cooling "
+            "target alone. The target rescaling amplifies each country's climate growth by its own "
+            "k_cool, which spans ~16x across Europe (Italy 3.55, Spain 0.87) and inverts the "
+            "model's Spain>Italy ranking — that amplification is what this flag removes. Output "
+            "goes to a '_freecool' run tag. Sector-split cooling only (cordex2energy_demand)."
+        ),
+    )
+    parser.add_argument(
         "--supply_scenario",
         type=str,
         default="HIGH",
@@ -597,6 +633,17 @@ if __name__ == "__main__":
     dm_tag = {"demand.ninja": "dninja", "cordex2energy_demand": "c2edem"}[demand_model]
     upsample_to_1h = demand_model == "demand.ninja"
 
+    # Validate the argument combination BEFORE anything is loaded or any output directory is
+    # created: the run takes ~14 minutes and creates its folder early, so a combination that can
+    # only fail later would leave a stray empty directory behind.
+    if not args.rescale_cooling and not (
+            demand_model == "cordex2energy_demand" and not legacy_thermal):
+        raise SystemExit(
+            "--no-cooling-target requires the split-target form: it is only meaningful when "
+            "heating and cooling carry separate targets, i.e. --demand_model "
+            "cordex2energy_demand without --legacy_thermal."
+        )
+
     is_cerra = climate_model.lower() == "cerra"
 
     # Map CLI supply scenario to the column suffix used in the TYNDP Excel files.
@@ -659,6 +706,10 @@ if __name__ == "__main__":
     )
     if legacy_thermal:
         _run_tag += "_legacythermal"
+    if not args.rescale_cooling:
+        # Its own folder: the cooling level (and therefore the whole residual-load system) differs,
+        # so this must never share an output directory with a target-rescaled run.
+        _run_tag += "_freecool"
     if rolling_window_residual_load and rolling_window_residual_load > 1:
         _run_tag += f"_rlsmooth_{rolling_window_residual_load}"
     if args.use_reservoir_hydro:
@@ -836,15 +887,74 @@ if __name__ == "__main__":
             "heating_demand": thermal_targets["heating"],
             "cooling_demand": thermal_targets["cooling"],
         }
+        if not args.rescale_cooling:
+            # Dropping the key (rather than emptying it) is what switches rescaling off:
+            # `preprocess_thermal_demand` resolves a missing variable to None and skips it, so
+            # k_cool = 1 while heating keeps its own target. The baseload is NOT affected —
+            # `modulate_baseload` uses thermal_targets["total"/"heating"/"cooling"] directly, so it
+            # still reflects TYNDP's view of non-thermal demand and its cache stays valid.
+            del residual_targets["cooling_demand"]
+            print("  cooling target DISABLED (--no-cooling-target): k_cool = 1, heating unchanged.")
     else:
         residual_targets = {
             c: thermal_targets["heating"].get(c, 0.0) + thermal_targets["cooling"].get(c, 0.0)
             for c in set(thermal_targets["heating"]) | set(thermal_targets["cooling"])
         }
+        # `--no-cooling-target` with the lumped form was already rejected during argument
+        # validation, before any directory was created.
     residual_reference_period = None if legacy_thermal else REFERENCE_PERIOD
-    # cordex2energy_demand is already electric → no COP loss factor (it cancels
-    # under target rescaling anyway, but matters for unmatched Balkan countries).
+    # cordex2energy_demand is already electric → no COP loss factor. Under target rescaling it
+    # cancels exactly; without a cooling target it no longer does, and 1.0 is still correct.
     thermal_loss_factor = 1.0 if demand_model == "cordex2energy_demand" else 1.176
+
+    # ── The realised rescale factors ──────────────────────────────────────────────
+    # k = target / simulated(reference period) multiplies the whole series, so it scales each
+    # country's CLIMATE GROWTH by the same factor. Printing it makes that amplification auditable —
+    # it is the single number that decides how much of a zone's projected change is the demand
+    # model and how much is the TYNDP scenario. Computed here from the pre-smoothing series; the
+    # centered rolling mean in preprocess_thermal_demand preserves the annual mean, so this matches
+    # the k actually applied to well under a percent.
+    if split_targets:
+        # `load_c2e_demand_nc` returns Datasets (and remaps the country coordinate to ISO2, so the
+        # targets and the series are keyed alike); the demand.ninja path builds bare DataArrays.
+        # Normalise to a DataArray so this works whichever branch produced the series.
+        def _as_da(obj, var):
+            return obj[var] if isinstance(obj, xr.Dataset) else obj
+
+        heat_da = _as_da(ds_heating_demand, "heating_demand")
+        cool_da = _as_da(ds_cooling_demand, "cooling_demand")
+
+        def _annual_twh(series):
+            window = (series.sel(time=slice(*REFERENCE_PERIOD))
+                      if residual_reference_period else series)
+            n_years = max(1, len(np.unique(window["time"].dt.year.values)))
+            # split_targets implies cordex2energy_demand, whose NetCDFs are hourly GW.
+            return float(window.sum()) * 1e-3 / n_years
+
+        available = set(map(str, heat_da.country.values))
+        k_rows = []
+        for iso in sorted(set(thermal_targets["heating"]) | set(thermal_targets["cooling"])):
+            if iso not in available:
+                continue
+            sim_h = _annual_twh(heat_da.sel(country=iso))
+            sim_c = _annual_twh(cool_da.sel(country=iso))
+            t_h = thermal_targets["heating"].get(iso, np.nan)
+            t_c = thermal_targets["cooling"].get(iso, np.nan)
+            k_rows.append(dict(
+                iso=iso, model_heat=sim_h, target_heat=t_h,
+                k_heat=t_h / sim_h if sim_h > 0 else np.nan,
+                model_cool=sim_c, target_cool=t_c,
+                k_cool=(t_c / sim_c if sim_c > 0 else np.nan) if args.rescale_cooling else 1.0))
+        if k_rows:
+            k_table = pd.DataFrame(k_rows).set_index("iso")
+            print(f"\n  Realised rescale factors over {REFERENCE_PERIOD} "
+                  f"(TWh/yr, k = target/model):")
+            print(k_table.round(2).to_string().replace("\n", "\n    "))
+            for label, column in (("k_heat", k_table.k_heat), ("k_cool", k_table.k_cool)):
+                note = ("   (rescaling OFF -> all 1.0)"
+                        if label == "k_cool" and not args.rescale_cooling else "")
+                print(f"    {label}  min {column.min():.2f}  median {column.median():.2f}"
+                      f"  max {column.max():.2f}{note}")
 
     # ── Compute estimated generation ──────────────────────────────────────────────
 

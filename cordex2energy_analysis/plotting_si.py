@@ -25,6 +25,7 @@ from matplotlib.ticker import MaxNLocator
 from .analysis import compute_sign_agreement
 from .extremes_analysis import mask_structural_zeros
 from .plotting import CMAPS
+from .plotting_extremes import whis_for
 from .plotting_paper import (
     ATTRIBUTION_SHADE_FLOOR,
     MAP_EXTENT,
@@ -701,7 +702,7 @@ def plot_driver_attribution_spread(
     ``attribution(zone, season)`` is the same callable Figs 3c/4c are drawn with, so this figure
     cannot drift away from them.
     """
-    q_low, q_high = style.spread_percentiles
+    whis = whis_for(style.spread)
     n_cols = 3
     n_rows = int(np.ceil(len(style.zones) / n_cols))
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(6.0 * n_cols, 4.2 * n_rows), squeeze=False)
@@ -718,7 +719,7 @@ def plot_driver_attribution_spread(
             for d_index, driver in enumerate(style.drivers):
                 values = per_chain[driver].values
                 boxes = ax.boxplot([values], positions=[d_index + offset], widths=width * 0.85,
-                                   patch_artist=True, showfliers=False, whis=(q_low, q_high),
+                                   patch_artist=True, showfliers=False, whis=whis,
                                    medianprops=dict(color="black", lw=1.2))
                 for box in boxes["boxes"]:
                     box.set_facecolor(style.driver_palette[driver])
@@ -770,7 +771,7 @@ def plot_flexibility_counterfactual(
     classes = ["sub_daily", "multi_day"]
     fig, axes = plt.subplots(len(classes), 1, figsize=(12, 4.4 * len(classes)), squeeze=False)
 
-    q_low, q_high = style.spread_percentiles
+    whis = whis_for(style.spread)
     positions = np.arange(len(style.zones))
     width = 0.8 / (2 * len(style.period_names))
 
@@ -785,7 +786,7 @@ def plot_flexibility_counterfactual(
                 per_zone = [data[data.zone == z]["freq_per_year"].values for z in style.zones]
                 offset = (slot - (2 * len(style.period_names) - 1) / 2) * width
                 boxes = ax.boxplot(per_zone, positions=positions + offset, widths=width * 0.85,
-                                   patch_artist=True, showfliers=False, whis=(q_low, q_high),
+                                   patch_artist=True, showfliers=False, whis=whis,
                                    medianprops=dict(color="black", lw=1.1))
                 for box in boxes["boxes"]:
                     box.set_facecolor(style.gwl_colors[period])

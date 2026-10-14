@@ -120,16 +120,21 @@ def _period_colors_with_defaults(
 # ---------------------------------------------------------------------------
 # Inter-model spread convention
 # ---------------------------------------------------------------------------
-SPREAD_PERCENTILES = {"iqr": (25.0, 75.0), "minmax": (0.0, 100.0)}
-SPREAD_LABEL = {"iqr": "IQR (P25–P75)", "minmax": "min–max"}
+#: (low, high) percentiles of the **box** for each convention.  For ``"tukey"`` the box is still the
+#: IQR — it is the *whisker* that follows a rule rather than a percentile, so see :func:`whis_for`.
+SPREAD_PERCENTILES = {"iqr": (25.0, 75.0), "minmax": (0.0, 100.0), "tukey": (25.0, 75.0)}
+SPREAD_LABEL = {"iqr": "IQR (P25–P75)", "minmax": "min–max", "tukey": "1.5×IQR (Tukey)"}
 
 
 def spread_qpair(spread: str = "iqr") -> "tuple[float, float]":
-    """Return the (low, high) percentile pair for a model-spread convention.
+    """Return the (low, high) **box** percentile pair for a model-spread convention.
 
-    ``"iqr"`` → (25, 75); ``"minmax"`` → (0, 100). With a small ensemble
-    (n ≈ 9) the 5th/95th percentiles are not meaningfully estimable, so only the
-    robust IQR and the honest full range are offered.
+    ``"iqr"`` → (25, 75); ``"minmax"`` → (0, 100); ``"tukey"`` → (25, 75). With a small ensemble
+    (n ≈ 9) the 5th/95th percentiles are not meaningfully estimable, so only the robust IQR, the
+    honest full range and the conventional Tukey rule are offered.
+
+    **Do not use this to draw whiskers or shaded bands.** Under ``"tukey"`` the extent is not a
+    percentile at all; use :func:`whis_for` for a boxplot and :func:`model_spread_bounds` for a band.
     """
     try:
         return SPREAD_PERCENTILES[spread]
@@ -139,10 +144,38 @@ def spread_qpair(spread: str = "iqr") -> "tuple[float, float]":
         ) from exc
 
 
+def whis_for(spread: str = "iqr"):
+    """The ``whis`` argument for ``Axes.boxplot`` under a model-spread convention.
+
+    Matplotlib accepts either a percentile pair or a float multiplier of the IQR, which is exactly
+    the split between the conventions: ``"iqr"``/``"minmax"`` are percentile pairs, while
+    ``"tukey"`` is the classical rule — the whisker reaches the most extreme observation lying
+    within 1.5 × IQR of the box, so it is data-dependent and cannot be expressed as a percentile.
+    """
+    return 1.5 if spread == "tukey" else spread_qpair(spread)
+
+
 def model_spread_bounds(values, spread: str = "iqr", axis=0):
-    """Low/high inter-model spread bounds for ``values`` along ``axis``."""
-    lo, hi = spread_qpair(spread)
-    return np.nanpercentile(values, lo, axis=axis), np.nanpercentile(values, hi, axis=axis)
+    """Low/high inter-model spread bounds for ``values`` along ``axis``.
+
+    Use this for every shaded band, so a band always matches the boxes drawn under the same
+    convention.  Under ``"tukey"`` the bounds are the **Tukey whiskers**: the most extreme
+    observations still inside ``[Q1 − 1.5·IQR, Q3 + 1.5·IQR]`` — the fences themselves are *not*
+    returned, because a band drawn to the fence would extend past real data wherever the ensemble
+    stops short of it.
+    """
+    if spread != "tukey":
+        lo, hi = spread_qpair(spread)
+        return np.nanpercentile(values, lo, axis=axis), np.nanpercentile(values, hi, axis=axis)
+
+    arr = np.asarray(values, dtype=float)
+    q1 = np.nanpercentile(arr, 25.0, axis=axis, keepdims=True)
+    q3 = np.nanpercentile(arr, 75.0, axis=axis, keepdims=True)
+    fence = 1.5 * (q3 - q1)
+    with np.errstate(invalid="ignore"):
+        low = np.nanmin(np.where(arr >= q1 - fence, arr, np.nan), axis=axis)
+        high = np.nanmax(np.where(arr <= q3 + fence, arr, np.nan), axis=axis)
+    return low, high
 
 
 def _kde_envelope(
@@ -1027,7 +1060,7 @@ def plot_seasonal_conditional_metrics(
     n_periods = len(period_names)
     period_colors = _period_colors_with_defaults(period_names, period_colors)
 
-    _whis = list(spread_qpair(spread))
+    _whis = whis_for(spread)
     n_seasons = len(season_order)
     box_w = 0.7 / n_periods
     # x position for each (season, period) box
@@ -1217,7 +1250,6 @@ def _render_cooccurrence_heatmaps(
     stipple_agreement=False, robust_n=7, spread="iqr",
 ):
     """Core heatmap renderer for a single season slice (or full period)."""
-    _qlo, _qhi = spread_qpair(spread)
 
     def _mat(sub, agg):
         return (sub.groupby(["zone_a", "zone_b"])["co_occurrence_pct"].agg(agg)
@@ -1229,8 +1261,8 @@ def _render_cooccurrence_heatmaps(
     for period_name in period_names:
         sub = df_coo[df_coo["period"] == period_name]
         median_mats[period_name] = _mat(sub, "median")
-        lo_mats[period_name] = _mat(sub, lambda s: np.nanpercentile(s, _qlo))
-        hi_mats[period_name] = _mat(sub, lambda s: np.nanpercentile(s, _qhi))
+        lo_mats[period_name] = _mat(sub, lambda s: model_spread_bounds(s, spread, axis=0)[0])
+        hi_mats[period_name] = _mat(sub, lambda s: model_spread_bounds(s, spread, axis=0)[1])
 
     w, h = figsize_per_panel
     n_periods = len(period_names)
@@ -2283,7 +2315,14 @@ def plot_event_diurnal_profile(
 
     period_order = list(period_defs.keys()) if period_defs is not None else sorted(df_diurnal["period"].unique())
     zone_strs    = [str(z) for z in zones]
-    _qlo, _qhi = (q / 100.0 for q in spread_qpair(spread))  # spread band fractions
+    # Band edges under the active convention.  Written as callables rather than quantile
+    # fractions because "tukey" is a rule, not a percentile — passing spread_qpair here
+    # would silently draw a plain IQR band under a "1.5xIQR" label.
+    def _lo(s):
+        return model_spread_bounds(np.asarray(s, dtype=float), spread, axis=0)[0]
+
+    def _hi(s):
+        return model_spread_bounds(np.asarray(s, dtype=float), spread, axis=0)[1]
 
     # ── Default palettes ──────────────────────────────────────────────────────
     if zone_colors is None:
@@ -2327,7 +2366,7 @@ def plot_event_diurnal_profile(
     # Set after plotting so the shared axis encompasses the full data range.
     _pct_ymax = (
         df_diurnal.groupby(["season", "zone", "hour"])["pct_event_steps"]
-        .quantile(_qhi)
+        .apply(_hi)
         .max()
     )
 
@@ -2341,8 +2380,8 @@ def plot_event_diurnal_profile(
 
             grp = df_sz.groupby("hour")["pct_event_steps"]
             med = grp.median().reindex(hours_sorted)
-            q25 = grp.quantile(_qlo).reindex(hours_sorted)
-            q75 = grp.quantile(_qhi).reindex(hours_sorted)
+            q25 = grp.apply(_lo).reindex(hours_sorted)
+            q75 = grp.apply(_hi).reindex(hours_sorted)
 
             col = zone_colors.get(zone_str, "gray")
             ax.plot(hours_sorted, med.values, color=col, lw=1.8,
@@ -2388,7 +2427,7 @@ def plot_event_diurnal_profile(
         # same scale.  Bar axis uses the max q75 of pct_event_steps; PV axis uses
         # the global max of both the event and total median PV profiles.
         _pct_s_ymax = (
-            df_s.groupby(["zone", "hour"])["pct_event_steps"].quantile(_qhi).max()
+            df_s.groupby(["zone", "hour"])["pct_event_steps"].apply(_hi).max()
         )
         _pv_s_ymax = max(
             df_s.groupby(["zone", "hour"])["mean_pv_event"].median().max(),
@@ -2416,8 +2455,8 @@ def plot_event_diurnal_profile(
             pct_med     = grp["pct_event_steps"].median().reindex(hours_sorted)
             pv_ev_med   = grp["mean_pv_event"].median().reindex(hours_sorted)
             pv_clim_med = grp["mean_pv_clim"].median().reindex(hours_sorted)
-            pv_ev_q25   = grp["mean_pv_event"].quantile(_qlo).reindex(hours_sorted)
-            pv_ev_q75   = grp["mean_pv_event"].quantile(_qhi).reindex(hours_sorted)
+            pv_ev_q25   = grp["mean_pv_event"].apply(_lo).reindex(hours_sorted)
+            pv_ev_q75   = grp["mean_pv_event"].apply(_hi).reindex(hours_sorted)
 
             # Fill NaN in PV-during-events (hours with no events) with the
             # climatological value, then interpolate any remaining gaps.
