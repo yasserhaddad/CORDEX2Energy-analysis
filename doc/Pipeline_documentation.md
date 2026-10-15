@@ -1,6 +1,6 @@
 # The CORDEX2Energy pipeline
 
-## Slide 1 · Pipeline overview
+## Slide 1 - Pipeline overview
 
 **From climate model output to residual-load extremes**
 
@@ -25,7 +25,7 @@
 
 ---
 
-## Slide 2 · The new demand model — degree days
+## Slide 2 - The new demand model — degree days
 
 **Population-weighted national degree days, Eurostat definition**
 
@@ -49,7 +49,7 @@ Heating is barely affected (≤ 7 %) — most of the year the daily mean is well
 
 ---
 
-## Slide 3 · The new demand model — our own coefficients
+## Slide 3 - The new demand model — our own coefficients
 
 **We fit the coefficients rather than adopting demand.ninja's literature parameters**
 
@@ -76,7 +76,7 @@ E_heat[c, y] = P0 + s_heat[c] · HDD_annual[c, y] + β[c] · (y − y0) + ε
 
 ---
 
-## Slide 4 · Cooling needs a different model — saturating and sector-split
+## Slide 4 - Cooling needs a different model — saturating and sector-split
 
 **Cooling is not a linear degree-day response**
 
@@ -113,7 +113,7 @@ saturated warm ones.)
 
 ---
 
-## Slide 5 · Daily → hourly
+## Slide 5 - Daily → hourly
 
 * Degree days are **daily by construction** and are never interpolated to hourly — that would
   fabricate a diurnal structure the quantity does not have.
@@ -123,7 +123,7 @@ saturated warm ones.)
 
 ---
 
-## Slide 6 · TYNDP projections
+## Slide 6 - TYNDP projections
 
 **TYNDP 2024 supplies the 2050 system; the climate supplies the weather**
 
@@ -138,12 +138,12 @@ saturated warm ones.)
   target is synthesised as *total demand × thermal share of a proxy* — UK→FR (maritime, comparable
   stock), CH→AT (alpine), NO→SE (Nordic). The Western Balkans are deliberately left unproxied.
 
-*Source: `conversion_energy/tyndp.py` (`build_tyndp_nuts_mapping`, `build_thermal_targets`,
-`compute_estimated_generation`).*
+*Source: `cordex2energy/conversion_energy/tyndp.py` (`build_tyndp_nuts_mapping`) and
+`cordex2energy_analysis/power_system.py` (`build_thermal_targets`, `compute_estimated_generation`).*
 
 ---
 
-## Slide 7 · Baseload — avoiding double-counting the weather
+## Slide 7 - Baseload — avoiding double-counting the weather
 
 **The problem:** TYNDP's hourly profiles already contain heating and cooling, for *their* climate
 year. We want to substitute *our* climate-driven thermal demand — so theirs must come out first.
@@ -171,7 +171,7 @@ in the residual load — otherwise the baseload carries a residue of the other m
 
 ---
 
-## Slide 8 · One asymmetry worth defending up front
+## Slide 8 - One asymmetry worth defending up front
 
 **Heating is pinned to the TYNDP target. Cooling is not.** (`--no-cooling-target`, the `freecool` tag.)
 
@@ -196,7 +196,7 @@ the sub-daily result. With `k_cool = 1` that falls to 4.7 %.
 
 ---
 
-## Slide 9 · Residual load
+## Slide 9 - Residual load
 
 ```
 residual_load = (baseload + heating + cooling) − (PV + wind_onshore + wind_offshore + hydro_RoR)
@@ -208,12 +208,12 @@ residual_load = (baseload + heating + cooling) − (PV + wind_onshore + wind_off
   filled with zero, not dropped.
 * All quantities in GWh. Country level → aggregated to the 6 balancing zones.
 
-*Source: `tyndp.py` (`compute_residual_load`), driver
+*Source: `cordex2energy_analysis/power_system.py` (`compute_residual_load`), driver
 `scripts/compute_tyndp_projections_extremes.py`.*
 
 ---
 
-## Slide 10 · Reservoir hydro dispatch
+## Slide 10 - Reservoir hydro dispatch
 
 **An annual optimisation, per country and calendar year (Gurobi QP)**
 
@@ -233,7 +233,7 @@ subject to E[t+1] = E[t] + inflow[t] − G[t]/η − spill[t]      (water balanc
 
 ---
 
-## Slide 11 · Battery dispatch
+## Slide 11 - Battery dispatch
 
 **The paper's scheme — `system`:** prosumer + utility batteries are treated as **one asset**,
 dispatched at **country level** with the **same annual-cyclical QP as the reservoir**, sequentially
@@ -260,7 +260,7 @@ first `commit_h`, carry the SOC forward. That models merchant scheduling with li
 
 ---
 
-## Slide 12 · What the dispatch is measured against
+## Slide 12 - What the dispatch is measured against
 
 * **Events** are detected on the post-dispatch residual load with the **Sequent Peak Algorithm**
   against a **single, season-independent CERRA p95 threshold per zone** (76.9 / 137.2 / 434.3 /

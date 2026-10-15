@@ -39,6 +39,10 @@ dependencies = [
     "geopandas>=0.9.0",
     "PyYAML>=5.0",
     "dask[complete]>=2021.0.0",
+    "pyxlsb>=1.0",
+    "openpyxl>=3.0",
+    # Reservoir and battery dispatch QPs; needs a full (e.g. academic) Gurobi licence.
+    "gurobipy>=13.0",
 ]
 
 [project.optional-dependencies]
@@ -61,3 +65,6 @@ namespaces = false
 [tool.black]
 line-length = 100
 target-version = ['py38', 'py39', 'py310', 'py311']
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,5 @@
+{
+    "path_data_processed": "/path/to/clim2energy-ch",
+    "path_data_analysis": "/path/to/analysis-cache",
+    "path_figs": "/path/to/CORDEX2Energy-analysis/figs"
+}

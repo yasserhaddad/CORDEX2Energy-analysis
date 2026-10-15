@@ -412,32 +412,32 @@ numbers below are the CURRENT ones, taken from the notes' own captions.
 **Note 1 — the conversion pipeline**, `notebooks/si_note1_pipeline.ipynb` → `figs/si_note1_pipeline/`
 
 **S1**
-the driving GCMs and the warming-level windows they define · **S2** change in European precipitation
-and runoff against warming, by season · **S3** the bias-corrected EURO-CORDEX variables, annual mean
-· **S4**–**S7** the same five variables in winter, spring, summer and autumn, one figure per season (DJF/MAM/JJA/SON) · **S8** total runoff
-against the channel discharge it is routed into, at +1.5 °C · **S9** where the demand model's error
-is and whether it is in the right years · **S10** the fitted air-conditioning adoption share and how
-sharply its curvature is determined · then one figure per conversion step: **S11** heating demand ·
-**S12** cooling demand · **S13** solar power · **S14** wind power · **S15** run-of-river generation ·
+the driving GCMs and the warming-level windows they define - **S2** change in European precipitation
+and runoff against warming, by season - **S3** the bias-corrected EURO-CORDEX variables, annual mean
+- **S4**–**S7** the same five variables in winter, spring, summer and autumn, one figure per season (DJF/MAM/JJA/SON) - **S8** total runoff
+against the channel discharge it is routed into, at +1.5 °C - **S9** where the demand model's error
+is and whether it is in the right years - **S10** the fitted air-conditioning adoption share and how
+sharply its curvature is determined - then one figure per conversion step: **S11** heating demand -
+**S12** cooling demand - **S13** solar power - **S14** wind power - **S15** run-of-river generation -
 **S16** reservoir inflow.
 
 **Note 2 — the power system**, `notebooks/si_note2_system.ipynb` → `figs/si_note2_system/`
 
-**S17** the TYNDP-2024 LOW/2050 build-out, per country and per zone · **S18** HIGH/2050 against
-LOW/2050 · **S19** baseload demand under the DE/2050 scenario · **S20** reservoir dispatch over the
-year · **S21** reservoir storage over the year · **S22** battery throughput by zone.
+**S17** the TYNDP-2024 LOW/2050 build-out, per country and per zone - **S18** HIGH/2050 against
+LOW/2050 - **S19** baseload demand under the DE/2050 scenario - **S20** reservoir dispatch over the
+year - **S21** reservoir storage over the year - **S22** battery throughput by zone.
 
 **Note 3 — the results**, `notebooks/si_note3_results.ipynb` → `figs/si_note3_results/`
 
-**S23** residual load by season · **S24** Figure 4 resolved by balancing zone, closing
-exactly on the Europe-wide change · **S25** CORDEX against CERRA in energy space, reference period ·
-**S26** the season-specific CERRA p95 deficit levels the paper does *not* use · **S27** the paper's
-deficit threshold inside the HIGH/2050 build-out · **S28** exceedance curves of the zonal residual
-load, for every balancing zone and every season · **S29** Figure 5c/d resolved by balancing zone
-(Iberia +12.5 and South-East +8.3 of the Europe-wide +21.8 sub-daily events/yr) · **S30** exceedance
-by hour of day and its driver decomposition, for each balancing zone · **S31** multi-day extreme
-events: frequency, seasonal decomposition and drivers · **S32** why Iberian attenuation degrades
-under warming · **S33** extreme events that survive the HIGH/2050 build-out, scored on the LOW/2050
+**S23** residual load by season - **S24** Figure 4 resolved by balancing zone, closing
+exactly on the Europe-wide change - **S25** CORDEX against CERRA in energy space, reference period -
+**S26** the season-specific CERRA p95 deficit levels the paper does *not* use - **S27** the paper's
+deficit threshold inside the HIGH/2050 build-out - **S28** exceedance curves of the zonal residual
+load, for every balancing zone and every season - **S29** Figure 5c/d resolved by balancing zone
+(Iberia +12.5 and South-East +8.3 of the Europe-wide +21.8 sub-daily events/yr) - **S30** exceedance
+by hour of day and its driver decomposition, for each balancing zone - **S31** multi-day extreme
+events: frequency, seasonal decomposition and drivers - **S32** why Iberian attenuation degrades
+under warming - **S33** extreme events that survive the HIGH/2050 build-out, scored on the LOW/2050
 threshold.
 
 Two of these carry the load the main text used to: **S30** is Figure 6's second row repeated for
