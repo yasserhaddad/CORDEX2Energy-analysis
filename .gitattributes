@@ -1,0 +1,5 @@
+# Notebook outputs (figures, printed tables) stay in the working copy but are never committed.
+# The filter is defined in the local git config:
+#   git config filter.strip-notebook-output.clean "jupyter nbconvert --ClearOutputPreprocessor.enabled=True --to notebook --stdin --stdout --log-level=ERROR"
+#   git config filter.strip-notebook-output.smudge cat
+*.ipynb filter=strip-notebook-output
