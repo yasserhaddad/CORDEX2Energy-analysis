@@ -3,7 +3,7 @@
 * main figures: `figs/paper_publication/figN.pdf`; SI: `figs/si_note*/SN_*.pdf` (+ EXTERNAL_SI)
 * both numberings contiguous from 1
 * every "Figure N" / "Fig. N" / "Supplementary Fig. SN" / "Supplementary Figure N" in the notebooks'
-  markdown and code and in doc/paper_summary.md points at a rendered figure
+  markdown and code and in doc/paper_summary.md (if present) points at a rendered figure
 * inside each note, the section heading (`## SN - ...`) and the figure stems `SN_...` written under it
   carry the same N
 
@@ -38,7 +38,10 @@ for label, numbers in (("main", main), ("supplementary", si)):
 
 texts = {name: "\n".join("".join(c["source"]) for c in json.loads(
     (ROOT / "notebooks" / f"{name}.ipynb").read_text())["cells"]) for name in NOTEBOOKS}
-texts["paper_summary.md"] = (ROOT / "doc" / "paper_summary.md").read_text()
+# The paper summary is a local, untracked note; check it when present.
+paper_summary = ROOT / "doc" / "paper_summary.md"
+if paper_summary.exists():
+    texts["paper_summary.md"] = paper_summary.read_text()
 # \s+ not a space: captions wrap, and "Supplementary\nFig. 6" is still a supplementary reference.
 SUPP = re.compile(r"Supplementary\s+(?:Fig\.|Figs\.|Figure|Figures)\s*S?(\d+)")
 MAIN = re.compile(r"\b(?:Figure|Fig\.)\s+(\d+)(?![\d.])")
