@@ -4,21 +4,22 @@ Two kinds of entry, both pickled under ``<path_data_analysis>/figure_cache/``:
 
 * **Monthly totals** of the per-country run output and of the demand product. Every consumer of
   those series (``compute_country_gwl_field``, ``compute_c2e_gwl_field``, the Europe-wide table)
-  slices whole-year GWL windows, filters whole months and sums by year, so calendar-month sums are
-  an EXACT substitute for the 3-hourly / daily series -- at ~1/250 of the size, which is what turns
-  every country field from a pass over the network disk into an in-memory sum.
+  slices whole-year warming-level windows, filters whole months and sums by year, so
+  calendar-month sums are an exact substitute for the 3-hourly or daily series at a fraction of
+  the size.
 * **Analysis tables** (event statistics, attenuation, ...) through :func:`cached`.
 
-Every key carries the size and mtime of the raw input files, and the analysis tables' keys also
-carry a hash of every non-plotting module in this package: a library fix (the severity-units fix,
-say) invalidates every table automatically, while a styling change never does.
+Every key carries the size and modification time of the raw input files; the analysis tables'
+keys also carry a hash of every non-plotting module of the package, so a change to the analysis
+code invalidates them while a styling change does not.
 
-``C2E_FIGCACHE=refresh`` recomputes and overwrites every entry; ``C2E_FIGCACHE=off`` bypasses the
-cache entirely. Each lookup prints one ``[cache]`` line, so a notebook's output records what it
-reused.
+The environment variable ``C2E_FIGCACHE`` selects the mode: ``on`` (default), ``refresh``
+(recompute and overwrite every entry) or ``off`` (bypass the cache). Each lookup prints one
+``[cache]`` line.
 """
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
@@ -28,12 +29,24 @@ from pathlib import Path
 
 import xarray as xr
 
+#: Directory of this package; ``paths.json`` is read from its parent.
 PACKAGE = Path(__file__).resolve().parent
-#: Bumped whenever the construction of a monthly entry changes, which no file stamp would notice.
+#: Version of the monthly-entry construction, part of their keys; bump it when that changes.
 MONTHLY_VERSION = 1
 
 
 def cache_mode() -> str:
+    """Cache mode from ``C2E_FIGCACHE``.
+
+    Returns
+    -------
+    {"on", "refresh", "off"}
+
+    Raises
+    ------
+    ValueError
+        If the variable holds anything else.
+    """
     mode = os.environ.get("C2E_FIGCACHE", "on").strip().lower()
     if mode not in ("on", "refresh", "off"):
         raise ValueError(f"C2E_FIGCACHE={mode!r}: expected on, refresh or off")
@@ -41,23 +54,72 @@ def cache_mode() -> str:
 
 
 def cache_root() -> Path:
+    """Cache directory, ``<path_data_analysis>/figure_cache`` from ``paths.json``.
+
+    Returns
+    -------
+    pathlib.Path
+    """
     paths = json.loads((PACKAGE.parent / "paths.json").read_text())
     return Path(paths["path_data_analysis"]) / "figure_cache"
 
 
+def _code_without_docstrings(source: str) -> str:
+    """The abstract syntax tree of a module, without docstrings, as a string.
+
+    Comments, formatting and docstrings do not change it, so editing documentation does not
+    invalidate the cache; any change to the code does.
+
+    Parameters
+    ----------
+    source : str
+        Module source.
+
+    Returns
+    -------
+    str
+    """
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            body = node.body
+            if body and isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], "value", None), ast.Constant) \
+                    and isinstance(body[0].value.value, str):
+                node.body = body[1:] or [ast.Pass()]
+    return ast.dump(tree, include_attributes=False)
+
+
 def code_fingerprint() -> str:
-    """Hash of every analysis module in the package -- everything except the plotting modules."""
+    """Hash of the code of every analysis module (not the plotting and figure modules).
+
+    Returns
+    -------
+    str
+        SHA-256 hex digest over the module names and their code without docstrings or comments,
+        in sorted order.
+    """
     digest = hashlib.sha256()
     for path in sorted(PACKAGE.glob("*.py")):
-        if path.name.startswith("plotting") or path.name == "figure_cache.py":
+        if path.name.startswith(("plotting", "figures_")) or path.name == "figure_cache.py":
             continue
         digest.update(path.name.encode())
-        digest.update(path.read_bytes())
+        digest.update(_code_without_docstrings(path.read_text()).encode())
     return digest.hexdigest()
 
 
 def file_stamps(files) -> list:
-    """``(path, size, mtime_ns)`` per input file: a re-produced input is a different entry."""
+    """Identity of each input file, so a re-produced input yields a different key.
+
+    Parameters
+    ----------
+    files : iterable of path-like
+        Input files.
+
+    Returns
+    -------
+    list of tuple
+        ``(path, size, mtime_ns)`` per file.
+    """
     stamps = []
     for path in map(Path, files):
         stat = path.stat()
@@ -66,6 +128,18 @@ def file_stamps(files) -> list:
 
 
 def _jsonable(value):
+    """JSON fallback for key values: ``to_dict()``, ``tolist()``, else ``str()``.
+
+    Parameters
+    ----------
+    value : object
+        Value ``json.dumps`` cannot serialise.
+
+    Returns
+    -------
+    object
+        A JSON-serialisable stand-in.
+    """
     if hasattr(value, "to_dict"):                      # DataArray, Series, DataFrame
         return value.to_dict()
     if hasattr(value, "tolist"):                       # numpy
@@ -76,8 +150,24 @@ def _jsonable(value):
 def cached(name: str, compute, *, key=None, files=(), code: bool = True):
     """``compute()``, or its pickled result from an earlier run with the same key.
 
-    ``key``: every setting the result depends on (JSON-serialisable, or an xarray/pandas/numpy
-    object). ``files``: the raw inputs it reads. ``code``: include the analysis-code hash.
+    Parameters
+    ----------
+    name : str
+        Entry name, the prefix of the cache file name.
+    compute : callable
+        Computes the value when it is not cached.
+    key : object, optional
+        Every setting the result depends on: JSON-serialisable, or xarray, pandas or numpy
+        objects.
+    files : iterable of path-like
+        Raw inputs the result is computed from (see :func:`file_stamps`).
+    code : bool
+        Include :func:`code_fingerprint` in the key.
+
+    Returns
+    -------
+    object
+        The computed or cached value.
     """
     mode = cache_mode()
     if mode == "off":
@@ -106,10 +196,18 @@ def cached(name: str, compute, *, key=None, files=(), code: bool = True):
 
 
 def monthly_totals(data):
-    """Calendar-month sums along ``time`` of every time-carrying variable, loaded into memory.
+    """Calendar-month sums along ``time``, loaded into memory.
 
-    Exact for any reduction built from whole months (see the module docstring). Variables without a
-    ``time`` dimension are dropped: a resample would otherwise broadcast them along time.
+    Parameters
+    ----------
+    data : xarray.Dataset or xarray.DataArray
+        Series with a ``time`` dimension. Dataset variables without ``time`` are dropped, since
+        a resample would broadcast them along time.
+
+    Returns
+    -------
+    xarray.Dataset or xarray.DataArray
+        One step per month, labelled by its first day; NaNs are skipped.
     """
     if isinstance(data, xr.Dataset):
         data = data[[name for name, variable in data.data_vars.items() if "time" in variable.dims]]
@@ -117,14 +215,25 @@ def monthly_totals(data):
 
 
 def country_monthly(run_dirs: dict, files) -> dict:
-    """``{model: Dataset}`` of monthly totals of the per-country run output, ``files`` merged.
+    """Monthly totals of the per-country run output of every chain. Cached.
 
-    ``run_dirs``: ``{model: <residual_load>/<chain>_<scenario>/<run_tag>}``.
+    Parameters
+    ----------
+    run_dirs : dict
+        ``{chain: <residual_load>/<chain>_<scenario>/<run tag>}``.
+    files : iterable of str
+        Output files of each run folder, merged.
+
+    Returns
+    -------
+    dict
+        ``{chain: xarray.Dataset}`` of :func:`monthly_totals`.
     """
     files = tuple(files)
     inputs = [Path(directory) / name for directory in run_dirs.values() for name in files]
 
     def compute():
+        """Monthly totals of every chain's run files."""
         out = {}
         for model, directory in run_dirs.items():
             datasets = [xr.open_dataset(Path(directory) / name) for name in files]
@@ -140,22 +249,36 @@ def country_monthly(run_dirs: dict, files) -> dict:
 
 
 def demand_monthly(path_demand, models, scenario: str, variables=("heating", "cooling")) -> dict:
-    """``{variable: DataArray(model, country, time)}``: monthly sums of the DAILY-MEAN demand, GW.
+    """Monthly sums of the daily-mean heating and cooling demand of every chain. Cached.
 
-    The notebooks' former ``_demand_daily`` followed by monthly sums, in float64 (that construction
-    reduced in the file's float32), so a period-mean total is still ``sum * 24e-3`` TWh. Countries stay keyed by NAME; the ISO2 mapping
-    is the caller's, as before.
+    Parameters
+    ----------
+    path_demand : path-like
+        Folder of the demand product, one ``<chain>_<scenario>.nc`` per chain.
+    models : sequence of str
+        Chains.
+    scenario : str
+        Emission scenario of the file names.
+    variables : sequence of str
+        Demand variables; ``"<variable>_demand"`` is read from each file.
+
+    Returns
+    -------
+    dict
+        ``{variable: DataArray (model, country, time)}`` in GW-days per month, float64, so a
+        period sum times ``24e-3`` is TWh. Countries are keyed by name, as in the product.
     """
     inputs = [Path(path_demand) / f"{model}_{scenario}.nc" for model in models]
 
     def compute():
+        """Monthly demand totals of every chain and variable."""
         out = {}
         for variable in variables:
             per_model = []
             for model, path in zip(models, inputs):
                 with xr.open_dataset(path) as dataset:
-                    # float64 BEFORE any reduction: the product is stored as float32, and summing
-                    # ~7300 float32 daily means per window drifts by ~5e-6 relative.
+                    # float64 before any reduction: the product is float32, and summing ~7300
+                    # float32 daily means per window drifts by ~5e-6 relative.
                     daily = (dataset[f"{variable}_demand"].astype("float64")
                              .resample(time="1D").mean())
                     per_model.append(monthly_totals(daily).expand_dims(model=[model]))

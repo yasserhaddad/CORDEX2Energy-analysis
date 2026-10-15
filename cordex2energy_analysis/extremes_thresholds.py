@@ -1,18 +1,24 @@
-"""POT and TAILS automated threshold selection, plus xarray calibration wrappers.
+"""Deficit thresholds for extreme residual-load events.
 
-Both methods share the GPD / A²_right engine from ``extremes_statistics``.
+Three methods are available through :func:`compute_active_threshold` (annual) and
+:func:`calibrate_seasonal_active_thresholds` (per season):
 
-POT (``find_evt_pot_threshold``)
-    Scans candidate percentiles low→high and stops at the first threshold where
-    a right-tail-weighted Anderson-Darling bootstrap test does not reject the
-    GPD fit at the given significance level.
+``"PERCENTILE"`` (:func:`find_fixed_percentile_threshold`)
+    A fixed percentile of the strictly positive residual load. Used in the paper.
+``"EVT"`` (:func:`find_evt_pot_threshold`)
+    Peaks over threshold: the lowest candidate threshold at which a generalised
+    Pareto distribution (GPD) fitted to the excesses is not rejected by a
+    parametric-bootstrap right-tail Anderson-Darling test.
+``"TAILS"`` (:func:`find_tails_threshold`)
+    The threshold-selection steps of the TAILS framework (Supplementary Method 1,
+    eqs. 1-9): knee-point lower bound, fine quantile grid, filter on goodness of fit
+    and event count, minimum quantile-distance optimum, and the range of thresholds
+    indistinguishable from it. Bootstrap refits use L-moments and the filter uses the
+    right-tail Anderson-Darling statistic.
 
-TAILS (``find_tails_threshold``)
-    Implements the threshold-selection architecture of the TAILS framework
-    (knee-point lower bound → fine quantile grid → filter → minimum-distance
-    optimum → indistinguishable threshold range), with two substitutions for
-    speed and tail sensitivity: L-moment bootstrap refits and A²_right filter
-    statistic instead of the paper's standard AD.
+Every threshold is finally floored at zero (a genuine supply deficit) and zones with
+too few deficit steps are flagged as degenerate (:func:`_apply_deficit_floor`).
+The GPD statistics are in :mod:`cordex2energy_analysis.extremes_statistics`.
 """
 from __future__ import annotations
 
@@ -31,279 +37,362 @@ from .extremes_statistics import (
     _gpd_cdf_vectorised,
 )
 
+# Fewest excesses for which a GPD is fitted at a candidate threshold.
+_MIN_EXCESSES = 30
+
 
 # ---------------------------------------------------------------------------
-# POT threshold selection
+# Peaks over threshold (EVT)
 # ---------------------------------------------------------------------------
 
 
 def find_evt_pot_threshold(
-    zone_data,
-    min_p: float = 0.9,
-    max_p: float = 0.995,
+    residual_load,
+    min_quantile: float = 0.9,
+    max_quantile: float = 0.995,
     num_candidates: int = 50,
     n_bootstrap: int = 199,
     p_value_threshold: float = 0.05,
 ) -> float:
-    """Find a statistically robust POT threshold using the right-tail Anderson-Darling test.
-
-    Scans candidate thresholds from low to high percentile (90th → 99.5th), fitting a
-    GPD to the excesses and testing the fit with the right-tail weighted Anderson-Darling
-    (A²_right) test.  The first (lowest) threshold where the test does not reject at
-    α = p_value_threshold is returned, the default being 0.05 to maximise the number of
-    exceedances and minimise estimation variance.
-
-    The p-value is estimated via a parametric bootstrap.  To keep the bootstrap fast,
-    the bootstrap refits use L-moment estimators (closed-form, no optimiser) rather than
-    MLE.  L-moments are consistent for GPD when ξ < 1 (all finite-mean cases encountered
-    in practice) and produce a valid null distribution for the purpose of calibrating the
-    test.  MLE is still used for the single fit to the observed excesses.
+    """Peaks-over-threshold threshold from a GPD goodness-of-fit scan.
 
     Parameters
     ----------
-    zone_data :
-        1-D array of 3-hourly residual loads for the reference period.
-    min_p :
-        Lowest percentile (of positive RL values) to consider as a candidate.
-    max_p :
-        Highest percentile to consider.
-    num_candidates :
-        Number of evenly spaced candidate thresholds.
-    n_bootstrap :
-        Bootstrap replicates for the p-value estimate.
+    residual_load : numpy.ndarray
+        1-D reference-period residual-load values. Only strictly positive values are
+        used.
+    min_quantile : float, default 0.9
+        Lowest candidate, as a quantile level of the positive values.
+    max_quantile : float, default 0.995
+        Highest candidate, as a quantile level of the positive values.
+    num_candidates : int, default 50
+        Number of candidate quantile levels, evenly spaced between the two bounds.
+    n_bootstrap : int, default 199
+        Parametric-bootstrap replicates for each p-value.
+    p_value_threshold : float, default 0.05
+        Significance level: a candidate is accepted when its p-value exceeds it.
 
     Returns
     -------
     float
-        Robust POT threshold in GW.  Falls back to the 99th percentile of
-        positive RL values if no candidate passes the test.
+        The lowest accepted candidate, in the units of ``residual_load``; the 99th
+        percentile of the positive values if no candidate is accepted.
+
+    Notes
+    -----
+    Candidates are scanned from low to high. At each candidate ``u`` a GPD (location
+    0) is fitted to the excesses ``x - u`` by maximum likelihood and the right-tail
+    Anderson-Darling statistic ``A2_right`` of the fit is computed. Its p-value is
+    estimated by a parametric bootstrap: samples are drawn from the fitted GPD,
+    refitted by L-moments (closed form, valid for shape < 1), and
+    ``p = (#{A2_boot >= A2_obs} + 1) / (n_valid + 1)``. The scan stops at the first
+    accepted candidate, or when fewer than 30 excesses remain. The random seed is
+    fixed (0), so results are reproducible.
     """
-    positive_rl = zone_data[zone_data > 0]
+    positive_values = residual_load[residual_load > 0]
 
     candidates = np.percentile(
-        positive_rl, np.linspace(min_p * 100, max_p * 100, num_candidates)
+        positive_values, np.linspace(min_quantile * 100, max_quantile * 100, num_candidates)
     )
 
     best_threshold = None
-    rng = np.random.default_rng(0)  # fixed seed → deterministic across models
+    random_generator = np.random.default_rng(0)
 
-    # Scan LOW→HIGH: stop at the first (lowest) threshold where GPD holds.
-    # This maximises exceedances and minimises estimation variance.
-    for u in candidates:
-        excesses = positive_rl[positive_rl > u] - u
+    for candidate in candidates:
+        excesses = positive_values[positive_values > candidate] - candidate
 
-        if len(excesses) < 30:
-            break  # going higher will only reduce exceedances further
+        if len(excesses) < _MIN_EXCESSES:
+            break
 
-        # MLE for the observed excesses (accurate single fit)
         try:
-            c, loc, scale = stats.genpareto.fit(excesses, floc=0)
+            shape, location, scale = stats.genpareto.fit(excesses, floc=0)
         except Exception:
             continue
 
-        z_obs = np.sort(stats.genpareto.cdf(excesses, c, loc=loc, scale=scale))
-        t_obs = _gpd_right_tail_ad_statistic(z_obs)
+        pit_observed = np.sort(stats.genpareto.cdf(excesses, shape, loc=location, scale=scale))
+        statistic_observed = _gpd_right_tail_ad_statistic(pit_observed)
 
-        n_exc = len(excesses)
-        sim_sorted, xi_b, sigma_b, valid = _lmoment_gpd_bootstrap_refit(
-            c, scale, n_exc, n_bootstrap, rng
+        simulated_sorted, shape_refit, scale_refit, valid = _lmoment_gpd_bootstrap_refit(
+            shape, scale, len(excesses), n_bootstrap, random_generator
         )
         n_valid = int(valid.sum())
         if n_valid == 0:
             continue
 
-        xi_v = xi_b[valid, np.newaxis]
-        sig_v = sigma_b[valid, np.newaxis]
-        x_v = sim_sorted[valid]
+        # Rows are sorted and the GPD CDF is monotone, so the PIT rows are sorted too.
+        pit_bootstrap = _gpd_cdf_vectorised(
+            simulated_sorted[valid], shape_refit[valid, np.newaxis], scale_refit[valid, np.newaxis]
+        )
+        statistic_bootstrap = _gpd_right_tail_ad_batch(pit_bootstrap)
 
-        # sim_sorted rows are already sorted, and GPD CDF is monotone → z_b rows are sorted
-        z_b = _gpd_cdf_vectorised(x_v, xi_v, sig_v)
-        t_b = _gpd_right_tail_ad_batch(z_b)
-
-        p_value = (float(np.sum(t_b >= t_obs)) + 1.0) / (n_valid + 1.0)
+        p_value = (float(np.sum(statistic_bootstrap >= statistic_observed)) + 1.0) / (n_valid + 1.0)
 
         if p_value > p_value_threshold:
-            best_threshold = u
-            break  # lowest threshold where GPD holds — stop here
+            best_threshold = candidate
+            break
 
     if best_threshold is None:
-        best_threshold = np.percentile(positive_rl, 99)
+        best_threshold = np.percentile(positive_values, 99)
 
     return float(best_threshold)
 
 
 def compute_evt_thresholds_for_all_zones(
-    ds_reference, min_p=0.9, p_value_threshold=0.05, country_dim="zone"
+    reference_residual_load, min_quantile=0.9, p_value_threshold=0.05, zone_dim="zone"
 ) -> "tuple[xr.DataArray, xr.DataArray]":
-    """Vectorized wrapper to run the EVT threshold identification across all zones.
+    """Run :func:`find_evt_pot_threshold` for every zone.
+
+    Parameters
+    ----------
+    reference_residual_load : xarray.DataArray
+        Reference-period residual load with a ``zone_dim`` dimension. Non-finite
+        values are dropped per zone.
+    min_quantile : float, default 0.9
+        Passed to :func:`find_evt_pot_threshold`.
+    p_value_threshold : float, default 0.05
+        Passed to :func:`find_evt_pot_threshold`.
+    zone_dim : str, default "zone"
+        Name of the zone dimension.
 
     Returns
     -------
-    da_thresholds :
-        EVT threshold in GW for each zone.
-    min_p :
-        Minimum percentile of positive RL values to consider as a candidate.
-    da_percentiles :
-        Empirical percentile (0–100) of the threshold within the finite
-        (non-NaN) values of the reference period.  NaN entries (e.g. from a
-        prior ``.where()`` filter) are stripped before both threshold finding
-        and percentile computation, so the percentile is always relative to
-        the domain on which the threshold was actually calibrated.
+    thresholds : xarray.DataArray
+        Threshold per zone (name ``evt_threshold``), in the input units.
+    percentiles : xarray.DataArray
+        Empirical percentile (0-100) of each threshold among the zone's finite values
+        (name ``evt_threshold_pct``).
     """
-    threshold_dict: dict = {}
-    percentile_dict: dict = {}
+    threshold_by_zone: dict = {}
+    percentile_by_zone: dict = {}
 
-    for zone in ds_reference[country_dim].values:
-        zone_series = ds_reference.sel({country_dim: zone}).values.flatten()
+    for zone in reference_residual_load[zone_dim].values:
+        zone_values = reference_residual_load.sel({zone_dim: zone}).values.flatten()
+        zone_values = zone_values[np.isfinite(zone_values)]
 
-        valid_mask = np.isfinite(zone_series)
-        zone_series = zone_series[valid_mask]
+        threshold = find_evt_pot_threshold(
+            zone_values, min_quantile=min_quantile, p_value_threshold=p_value_threshold
+        )
+        threshold_by_zone[zone] = threshold
+        percentile_by_zone[zone] = float(np.mean(zone_values <= threshold) * 100)
 
-        u_robust = find_evt_pot_threshold(zone_series, min_p=min_p, p_value_threshold=p_value_threshold)
-        threshold_dict[zone] = u_robust
-        percentile_dict[zone] = float(np.mean(zone_series <= u_robust) * 100)
-
-    _zones = list(threshold_dict.keys())
-    da_thresholds = xr.DataArray(
-        list(threshold_dict.values()),
-        coords={country_dim: _zones},
-        dims=[country_dim],
+    zones = list(threshold_by_zone.keys())
+    thresholds = xr.DataArray(
+        list(threshold_by_zone.values()),
+        coords={zone_dim: zones},
+        dims=[zone_dim],
         name="evt_threshold",
     )
-    da_percentiles = xr.DataArray(
-        list(percentile_dict.values()),
-        coords={country_dim: _zones},
-        dims=[country_dim],
+    percentiles = xr.DataArray(
+        list(percentile_by_zone.values()),
+        coords={zone_dim: zones},
+        dims=[zone_dim],
         name="evt_threshold_pct",
     )
-
-    return da_thresholds, da_percentiles
+    return thresholds, percentiles
 
 
 def calibrate_seasonal_evt_thresholds(
-    ds_rl_ref: xr.Dataset,
+    reference_residual_load: xr.Dataset,
     zones,
     season_order: list[str],
     season_months: dict[str, list[int]],
     zone_dim: str = "zone",
 ) -> "tuple[dict[str, dict[str, float]], dict[str, dict[str, float]]]":
-    """Calibrate per-season EVT thresholds for all zones from the reference period.
+    """Run :func:`find_evt_pot_threshold` for every (zone, season).
 
     Parameters
     ----------
-    ds_rl_ref :
-        Reference-period residual load dataset (must contain ``residual_load``).
-    zones :
+    reference_residual_load : xarray.Dataset
+        Reference-period dataset with a ``residual_load`` variable and a ``time``
+        coordinate.
+    zones : sequence
         Zone coordinate values.
-    season_order :
-        Season names in display order (e.g. ``["DJF", "MAM", "JJA", "SON"]``).
-    season_months :
-        Mapping ``{season: [month_ints]}``.
-    zone_dim :
-        Name of the zone dimension (default ``"zone"``).
+    season_order : list of str
+        Season names, e.g. ``["DJF", "MAM", "JJA", "SON"]``.
+    season_months : dict
+        Mapping ``season -> list of calendar months``.
+    zone_dim : str, default "zone"
+        Name of the zone dimension.
 
     Returns
     -------
-    thresholds :
-        ``{zone: {season: float}}`` — EVT threshold in GW for each (zone, season).
-    percentiles :
-        ``{zone: {season: float}}`` — empirical percentile (0–100) of each
-        threshold within all 3-hourly RL values of that season's reference slice.
+    thresholds : dict
+        ``{zone: {season: threshold}}`` in the input units; zone keys are strings.
+    percentiles : dict
+        ``{zone: {season: percentile}}``: empirical percentile (0-100) of each
+        threshold among all values of that season.
     """
-    times_ref = pd.DatetimeIndex(ds_rl_ref["time"].values)
+    times = pd.DatetimeIndex(reference_residual_load["time"].values)
     thresholds: dict[str, dict[str, float]] = {}
     percentiles: dict[str, dict[str, float]] = {}
     for zone in zones:
-        zk = str(zone)
-        thresholds[zk] = {}
-        percentiles[zk] = {}
-        rl_ref_z = ds_rl_ref["residual_load"].sel({zone_dim: zone}).values
+        zone_key = str(zone)
+        thresholds[zone_key] = {}
+        percentiles[zone_key] = {}
+        zone_values = reference_residual_load["residual_load"].sel({zone_dim: zone}).values
         for season in season_order:
-            mask = np.isin(times_ref.month, season_months[season])
-            season_rl = rl_ref_z[mask]
-            thr = find_evt_pot_threshold(season_rl)
-            thresholds[zk][season] = thr
-            percentiles[zk][season] = float(np.mean(season_rl <= thr) * 100)
+            season_values = zone_values[np.isin(times.month, season_months[season])]
+            threshold = find_evt_pot_threshold(season_values)
+            thresholds[zone_key][season] = threshold
+            percentiles[zone_key][season] = float(np.mean(season_values <= threshold) * 100)
     return thresholds, percentiles
 
 
 # ---------------------------------------------------------------------------
-# TAILS threshold selection
-# ---------------------------------------------------------------------------
-# Implements the threshold-selection architecture of the TAILS framework
-# (Supp. Method 1, eqs. 1-9 only — no SPA event identification), with the
-# L-moment bootstrap engine and A²_right filter statistic substituted in for
-# speed and tail sensitivity.
-#
-# Context this version is built for
-# -----------------------------------
-# - A FIXED reference period (1991-2020, 30 years).
-# - Multiple climate data SOURCES over the same reference period.  Call
-#   `find_tails_threshold` independently per (data source x region x indicator);
-#   there is no ensemble-pooling logic baked in here on purpose.
-# - "Event" here means a single run-length-declustered exceedance, NOT the
-#   sequent-peak-algorithm (SPA) event count from the paper.
+# TAILS
 # ---------------------------------------------------------------------------
 
 
-def _knee_point_quantile(values: np.ndarray, q_grid: np.ndarray) -> float:
-    """Locate the quantile of maximum curvature ("knee") of the tail-transformed
-    empirical distribution, used as the candidate lower bound (Supp. Method 1,
-    eq. 2).
+def _knee_point_quantile(values: np.ndarray, quantile_levels: np.ndarray) -> float:
+    """Knee of the empirical quantile curve, the TAILS lower bound (eq. 2).
+
+    Parameters
+    ----------
+    values : numpy.ndarray
+        1-D sample.
+    quantile_levels : numpy.ndarray
+        Increasing quantile levels in [0, 1] at which the curve is evaluated.
 
     Returns
     -------
     float
-        Quantile level (in [0, 1]) of the detected knee.
+        The quantile level at which the min-max normalised quantile curve lies
+        furthest above the straight line joining its end points.
     """
-    x = q_grid
-    y = np.quantile(values, q_grid)
+    quantiles = np.quantile(values, quantile_levels)
 
-    x_n = (x - x.min()) / (x.max() - x.min())
-    y_n = (y - y.min()) / (y.max() - y.min() + 1e-12)
+    levels_normalised = (quantile_levels - quantile_levels.min()) / (quantile_levels.max() - quantile_levels.min())
+    quantiles_normalised = (quantiles - quantiles.min()) / (quantiles.max() - quantiles.min() + 1e-12)
 
-    line = y_n[0] + (y_n[-1] - y_n[0]) * (x_n - x_n[0]) / (x_n[-1] - x_n[0])
-    diff = y_n - line
-    knee_idx = int(np.argmax(diff))
-    return float(x[knee_idx])
+    chord = (quantiles_normalised[0]
+             + (quantiles_normalised[-1] - quantiles_normalised[0]) * (levels_normalised - levels_normalised[0])
+             / (levels_normalised[-1] - levels_normalised[0]))
+    knee_index = int(np.argmax(quantiles_normalised - chord))
+    return float(quantile_levels[knee_index])
 
 
 def _z_normalize(series: np.ndarray, years: np.ndarray, threshold_type: str) -> np.ndarray:
-    """Z-normalisation per Supp. Method 1, eq. 4.
+    """Standardise a series to zero mean and unit standard deviation (TAILS eq. 4).
 
-    threshold_type='yearly' -> per-year mean/std
-    threshold_type='global' -> single mean/std across the whole reference period.
+    Parameters
+    ----------
+    series : numpy.ndarray
+        1-D values.
+    years : numpy.ndarray
+        Calendar year of each value.
+    threshold_type : {"yearly", "global"}
+        ``"yearly"`` standardises each year with its own mean and standard deviation;
+        any other value uses a single mean and standard deviation for the whole series.
+
+    Returns
+    -------
+    numpy.ndarray
+        The standardised series. A zero standard deviation is replaced by 1.
     """
     if threshold_type == "yearly":
-        out = np.empty_like(series, dtype=float)
-        for yr in np.unique(years):
-            mask = years == yr
-            mu, sigma = series[mask].mean(), series[mask].std(ddof=0)
-            sigma = sigma if sigma > 0 else 1.0
-            out[mask] = (series[mask] - mu) / sigma
-        return out
-    else:
-        mu, sigma = series.mean(), series.std(ddof=0)
-        sigma = sigma if sigma > 0 else 1.0
-        return (series - mu) / sigma
+        standardised = np.empty_like(series, dtype=float)
+        for year in np.unique(years):
+            in_year = years == year
+            mean, std = series[in_year].mean(), series[in_year].std(ddof=0)
+            std = std if std > 0 else 1.0
+            standardised[in_year] = (series[in_year] - mean) / std
+        return standardised
+    mean, std = series.mean(), series.std(ddof=0)
+    std = std if std > 0 else 1.0
+    return (series - mean) / std
 
 
 def _count_events(exceed_mask: np.ndarray) -> int:
-    """Decluster consecutive exceedances into events by run-length.
+    """Count contiguous runs of ``True`` in a boolean array.
 
-    One contiguous run of timesteps above threshold = one event.  Used only
-    for the TAILS eq. 7 minimum-event-count floor; not the energy-system event
-    detection (see ``detect_events`` in ``extremes_events``).
+    Parameters
+    ----------
+    exceed_mask : numpy.ndarray
+        1-D boolean exceedance mask.
+
+    Returns
+    -------
+    int
+        Number of runs (run-length declustered events). Used only for the TAILS
+        minimum-event-count filter (eq. 7).
     """
     if exceed_mask.sum() == 0:
         return 0
-    d = np.diff(exceed_mask.astype(int))
-    starts = np.sum(d == 1) + (1 if exceed_mask[0] else 0)
-    return int(starts)
+    steps = np.diff(exceed_mask.astype(int))
+    return int(np.sum(steps == 1) + (1 if exceed_mask[0] else 0))
+
+
+def _bootstrap_quantile_distances(
+    simulated: np.ndarray,
+    shape: np.ndarray,
+    scale: np.ndarray,
+    probabilities: np.ndarray,
+) -> np.ndarray:
+    """Mean absolute distance between sample quantiles and GPD quantiles (TAILS eq. 6).
+
+    Parameters
+    ----------
+    simulated : numpy.ndarray
+        ``(m, n)`` bootstrap samples of excesses.
+    shape : numpy.ndarray
+        ``(m, 1)`` GPD shapes refitted to each sample.
+    scale : numpy.ndarray
+        ``(m, 1)`` GPD scales refitted to each sample.
+    probabilities : numpy.ndarray
+        ``(k,)`` probability levels at which quantiles are compared.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``(m,)`` mean over the ``k`` levels of ``|sample quantile - GPD quantile|``.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        gpd_quantiles = stats.genpareto.ppf(probabilities[np.newaxis, :], shape, loc=0, scale=scale)
+    sample_quantiles = np.quantile(simulated, probabilities, axis=1).T
+    return np.mean(np.abs(sample_quantiles - gpd_quantiles), axis=1)
 
 
 @dataclass
 class TailsResult:
+    """Result of :func:`find_tails_threshold`.
+
+    Thresholds are in the units of the standardised (Z-normalised) series.
+
+    Attributes
+    ----------
+    threshold : float or None
+        Selected threshold (the 0.99 quantile when ``fallback_used``).
+    threshold_quantile : float or None
+        Quantile level of ``threshold``.
+    threshold_range : tuple of float or None
+        Lower and upper edge of the indistinguishable threshold range (eq. 9); None on
+        fallback.
+    threshold_range_quantile : tuple of float or None
+        Quantile levels of ``threshold_range``; None on fallback.
+    knee_quantile : float
+        Quantile level of the knee point (eq. 2).
+    q_lower : float
+        Lowest candidate quantile level: the knee rounded up to 0.01, at least the
+        minimum quantile.
+    candidates_quantile : numpy.ndarray
+        Candidate quantile levels (eq. 3).
+    distances : numpy.ndarray
+        Quantile distance per candidate (eq. 6); NaN where no fit was made.
+    ad_pvalues : numpy.ndarray
+        Bootstrap right-tail Anderson-Darling p-value per candidate; NaN where no fit
+        was made.
+    n_events : numpy.ndarray
+        Run-length event count per candidate.
+    passed_filter : numpy.ndarray
+        Boolean mask of candidates passing the eq. 7 filter.
+    fallback_used : bool
+        True when no candidate passed the filter.
+    diagnostics : dict
+        Filter counts and settings; on success also ``ci_band`` and ``best_distance``,
+        on fallback a ``reason``.
+    """
+
     threshold: float | None
     threshold_quantile: float | None
     threshold_range: tuple[float, float] | None
@@ -324,639 +413,628 @@ def find_tails_threshold(
     years: np.ndarray,
     invert: bool = False,
     threshold_type: str = "global",
-    q_min_baseline: float = 0.95,
+    min_quantile: float = 0.95,
     knee_grid_size: int = 200,
     quantile_step: float = 0.001,
     n_bootstrap: int = 199,
-    ad_p_threshold: float = 0.05,
+    p_value_threshold: float = 0.05,
     min_events_per_year: float = 1.0,
     n_quantile_levels: int = 50,
     random_seed: int = 0,
 ) -> TailsResult:
-    """TAILS automated threshold selection (Supp. Method 1, eqs. 1-9 only).
-
-    Designed for a FIXED reference period (e.g. 1991-2020) and run
-    independently per climate data source x region x indicator.
+    """TAILS automated threshold selection (Supplementary Method 1, eqs. 1-9).
 
     Parameters
     ----------
-    series :
-        Raw 1-D indicator time series for the reference period, before tail
-        transformation.
-    years :
-        Integer calendar-year label per timestep.
-    invert :
-        Set True for indicators where stress = low values (e.g. renewable
-        supply), so the tail transform (eq. 1) flips the series.
-    threshold_type :
-        'global' or 'yearly' — controls the Z-normalisation convention (eq. 4).
-    q_min_baseline :
-        Minimum admissible percentile (q_min in eq. 2), default 0.95.
-    knee_grid_size :
-        Number of quantile points used to locate the knee.
-    quantile_step :
-        Step size for the fine candidate grid (eq. 3), default 0.001.
-    n_bootstrap :
-        Bootstrap replicates per candidate threshold.
-    ad_p_threshold :
-        Filter cutoff on the mean A²_right-calibrated bootstrap p-value (eq. 7).
-    min_events_per_year :
-        Minimum identified events per year of reference period.
-    n_quantile_levels :
-        Z, number of evenly spaced probability levels used in the
-        empirical-vs-GPD distance metric (eq. 6).
-    random_seed :
-        Fixed seed for reproducible bootstrap draws.
+    series : numpy.ndarray
+        1-D reference-period values of the indicator.
+    years : numpy.ndarray
+        Calendar year of each value.
+    invert : bool, default False
+        Negate the series first, for indicators whose stress is low values (eq. 1).
+    threshold_type : {"global", "yearly"}, default "global"
+        Standardisation convention (eq. 4); see :func:`_z_normalize`.
+    min_quantile : float, default 0.95
+        Lowest admissible candidate quantile level (``q_min`` in eq. 2).
+    knee_grid_size : int, default 200
+        Number of quantile levels in [0.5, 1] used to locate the knee.
+    quantile_step : float, default 0.001
+        Spacing of the candidate quantile grid (eq. 3).
+    n_bootstrap : int, default 199
+        Bootstrap replicates per candidate.
+    p_value_threshold : float, default 0.05
+        A candidate passes the goodness-of-fit filter when its p-value exceeds this.
+    min_events_per_year : float, default 1.0
+        Minimum number of run-length events per year of data (eq. 7).
+    n_quantile_levels : int, default 50
+        Number of probability levels ``i / (n + 1)`` in the distance metric (eq. 6).
+    random_seed : int, default 0
+        Seed of the bootstrap random generator.
 
     Returns
     -------
     TailsResult
+        Selected threshold, its indistinguishable range and per-candidate diagnostics,
+        all on the standardised series.
+
+    Notes
+    -----
+    1. Negate the series if ``invert`` and standardise it (eqs. 1, 4).
+    2. Lower bound: the knee quantile level on [0.5, 1] rounded up to 0.01, at least
+       ``min_quantile`` (eq. 2).
+    3. Candidates: quantile levels from the lower bound to ``1 - quantile_step`` in
+       steps of ``quantile_step`` (eq. 3).
+    4. At each candidate with at least 30 excesses, fit a GPD by maximum likelihood,
+       draw ``n_bootstrap`` samples from it and refit each by L-moments (eq. 5).
+       Record the bootstrap p-value of the right-tail Anderson-Darling statistic and
+       the distance: the mean over replicates of the mean absolute difference between
+       the replicate's sample quantiles and its refitted GPD quantiles (eq. 6).
+    5. Filter: finite distance, p-value above ``p_value_threshold`` and at least
+       ``round(min_events_per_year * n_years)`` events (eq. 7). If nothing passes, the
+       0.99 quantile is returned with ``fallback_used=True``.
+    6. The optimum is the passing candidate with the smallest distance (eq. 8).
+    7. The bootstrap is repeated at the optimum; the contiguous run of passing
+       candidates around it whose distance lies within the 16th-84th percentile band
+       of the optimum's bootstrap distances is the indistinguishable range (eq. 9).
     """
-    rng = np.random.default_rng(random_seed)
+    random_generator = np.random.default_rng(random_seed)
     n_years = len(np.unique(years))
     min_events = max(1, round(min_events_per_year * n_years))
 
-    # Step 1: Tail transformation (eq. 1)
     transformed = -series if invert else series.astype(float)
+    standardised = _z_normalize(transformed, years, threshold_type)
 
-    # Step 4: Z-normalisation (eq. 4)
-    z_series = _z_normalize(transformed, years, threshold_type)
+    knee_quantile = _knee_point_quantile(standardised, np.linspace(0.50, 1.0, knee_grid_size))
+    q_lower = max(np.ceil(knee_quantile * 100) / 100.0, min_quantile)
 
-    # Step 2: Knee-point analysis (eq. 2)
-    knee_grid = np.linspace(0.50, 1.0, knee_grid_size)
-    knee_q = _knee_point_quantile(z_series, knee_grid)
-    q_lower = max(np.ceil(knee_q * 100) / 100.0, q_min_baseline)
+    candidate_quantiles = np.arange(q_lower, 1.0 - quantile_step, quantile_step)
+    if candidate_quantiles.size == 0:
+        candidate_quantiles = np.array([min_quantile])
 
-    # Step 3: Candidate threshold grid (eq. 3)
-    candidates_q = np.arange(q_lower, 1.0 - quantile_step, quantile_step)
-    if candidates_q.size == 0:
-        candidates_q = np.array([q_min_baseline])
+    probabilities = (np.arange(1, n_quantile_levels + 1)) / (n_quantile_levels + 1.0)
 
-    probs = (np.arange(1, n_quantile_levels + 1)) / (n_quantile_levels + 1.0)
+    distances = np.full(candidate_quantiles.shape, np.nan)
+    ad_pvalues = np.full(candidate_quantiles.shape, np.nan)
+    n_events = np.zeros(candidate_quantiles.shape, dtype=int)
 
-    distances = np.full(candidates_q.shape, np.nan)
-    ad_pvalues = np.full(candidates_q.shape, np.nan)
-    n_events_arr = np.zeros(candidates_q.shape, dtype=int)
+    for k, quantile_level in enumerate(candidate_quantiles):
+        candidate = np.quantile(standardised, quantile_level)
+        exceed_mask = standardised > candidate
+        excesses = standardised[exceed_mask] - candidate
 
-    for idx, q in enumerate(candidates_q):
-        u = np.quantile(z_series, q)
-        exceed_mask = z_series > u
-        excesses = z_series[exceed_mask] - u
-        n_exc = len(excesses)
+        n_events[k] = _count_events(exceed_mask)
 
-        n_events_arr[idx] = _count_events(exceed_mask)
-
-        if n_exc < 30:
+        if len(excesses) < _MIN_EXCESSES:
             continue
 
-        # Step 5: GPD fit + bootstrap (eq. 5)
         try:
-            c, _, scale = stats.genpareto.fit(excesses, floc=0)
+            shape, _, scale = stats.genpareto.fit(excesses, floc=0)
         except Exception:
             continue
         if scale <= 0:
             continue
 
-        sim_sorted, xi_b, sigma_b, valid = _lmoment_gpd_bootstrap_refit(
-            c, scale, n_exc, n_bootstrap, rng
+        simulated_sorted, shape_refit, scale_refit, valid = _lmoment_gpd_bootstrap_refit(
+            shape, scale, len(excesses), n_bootstrap, random_generator
         )
         n_valid = int(valid.sum())
         if n_valid == 0:
             continue
 
-        xi_v = xi_b[valid, np.newaxis]
-        sig_v = sigma_b[valid, np.newaxis]
-        x_v = sim_sorted[valid]
+        shape_valid = shape_refit[valid, np.newaxis]
+        scale_valid = scale_refit[valid, np.newaxis]
+        simulated_valid = simulated_sorted[valid]
 
-        z_b = _gpd_cdf_vectorised(x_v, xi_v, sig_v)
+        pit_bootstrap = _gpd_cdf_vectorised(simulated_valid, shape_valid, scale_valid)
+        pit_observed = np.sort(stats.genpareto.cdf(excesses, shape, loc=0, scale=scale))
+        statistic_observed = _gpd_right_tail_ad_statistic(pit_observed)
+        statistic_bootstrap = _gpd_right_tail_ad_batch(np.sort(pit_bootstrap, axis=1))
+        ad_pvalues[k] = (float(np.sum(statistic_bootstrap >= statistic_observed)) + 1.0) / (n_valid + 1.0)
 
-        # Filter statistic: A²_right instead of standard AD
-        z_obs = np.sort(stats.genpareto.cdf(excesses, c, loc=0, scale=scale))
-        t_obs = _gpd_right_tail_ad_statistic(z_obs)
-        t_b = _gpd_right_tail_ad_batch(np.sort(z_b, axis=1))
-        p_value = (float(np.sum(t_b >= t_obs)) + 1.0) / (n_valid + 1.0)
-        ad_pvalues[idx] = p_value
+        distances[k] = float(np.mean(
+            _bootstrap_quantile_distances(simulated_valid, shape_valid, scale_valid, probabilities)
+        ))
 
-        # Step 6: Quantile-quantile distance metric (eq. 6)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            theo_q = stats.genpareto.ppf(probs[np.newaxis, :], xi_v, loc=0, scale=sig_v)
-        emp_q_boot = np.quantile(x_v, probs, axis=1).T  # (n_valid, Z)
-        mean_abs_dist = np.mean(np.abs(emp_q_boot - theo_q), axis=1)  # (n_valid,)
-        distances[idx] = float(np.mean(mean_abs_dist))
-
-    # Step 7: Threshold filtering (eq. 7)
     passed = (
         np.isfinite(distances)
-        & (ad_pvalues > ad_p_threshold)
-        & (n_events_arr >= min_events)
+        & (ad_pvalues > p_value_threshold)
+        & (n_events >= min_events)
     )
 
-    _filter_diag = {
-        "n_candidates":    len(candidates_q),
+    filter_diagnostics = {
+        "n_candidates":    len(candidate_quantiles),
         "n_fit_ok":        int(np.sum(np.isfinite(distances))),
-        "n_pass_ad":       int(np.sum(np.isfinite(distances) & (ad_pvalues > ad_p_threshold))),
-        "n_pass_events":   int(np.sum(n_events_arr >= min_events)),
+        "n_pass_ad":       int(np.sum(np.isfinite(distances) & (ad_pvalues > p_value_threshold))),
+        "n_pass_events":   int(np.sum(n_events >= min_events)),
         "n_pass_all":      int(passed.sum()),
         "min_events_applied": min_events,
-        "ad_p_threshold":  ad_p_threshold,
+        "ad_p_threshold":  p_value_threshold,
     }
 
     if not passed.any():
-        fallback_q = 0.99
-        fallback_val = float(np.quantile(z_series, fallback_q))
+        fallback_quantile = 0.99
         return TailsResult(
-            threshold=fallback_val,
-            threshold_quantile=fallback_q,
+            threshold=float(np.quantile(standardised, fallback_quantile)),
+            threshold_quantile=fallback_quantile,
             threshold_range=None,
             threshold_range_quantile=None,
-            knee_quantile=knee_q,
+            knee_quantile=knee_quantile,
             q_lower=q_lower,
-            candidates_quantile=candidates_q,
+            candidates_quantile=candidate_quantiles,
             distances=distances,
             ad_pvalues=ad_pvalues,
-            n_events=n_events_arr,
+            n_events=n_events,
             passed_filter=passed,
             fallback_used=True,
             diagnostics={
                 "reason": "no candidate passed eq. 7 filter",
                 "n_years": n_years,
-                **_filter_diag,
+                **filter_diagnostics,
             },
         )
 
-    # Step 8: Optimal threshold = argmin distance among filtered
-    filtered_idx = np.where(passed)[0]
-    best_local = filtered_idx[np.argmin(distances[filtered_idx])]
-    best_q = candidates_q[best_local]
-    best_val = float(np.quantile(z_series, best_q))
-    best_dist = distances[best_local]
+    passed_indices = np.where(passed)[0]
+    best_index = passed_indices[np.argmin(distances[passed_indices])]
+    best_quantile = candidate_quantiles[best_index]
+    best_threshold = np.quantile(standardised, best_quantile)
 
-    # Step 9: Indistinguishable threshold range T* (eq. 9)
-    u_best = np.quantile(z_series, best_q)
-    exceed_mask_best = z_series > u_best
-    excesses_best = z_series[exceed_mask_best] - u_best
-    c_b, _, scale_b = stats.genpareto.fit(excesses_best, floc=0)
-    sim_sorted_b, xi_bb, sigma_bb, valid_b = _lmoment_gpd_bootstrap_refit(
-        c_b, scale_b, len(excesses_best), n_bootstrap, rng
+    excesses_best = standardised[standardised > best_threshold] - best_threshold
+    shape_best, _, scale_best = stats.genpareto.fit(excesses_best, floc=0)
+    simulated_best, shape_refit_best, scale_refit_best, valid_best = _lmoment_gpd_bootstrap_refit(
+        shape_best, scale_best, len(excesses_best), n_bootstrap, random_generator
     )
-    xi_vb = xi_bb[valid_b, np.newaxis]
-    sig_vb = sigma_bb[valid_b, np.newaxis]
-    x_vb = sim_sorted_b[valid_b]
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        theo_qb = stats.genpareto.ppf(probs[np.newaxis, :], xi_vb, loc=0, scale=sig_vb)
-    emp_qb = np.quantile(x_vb, probs, axis=1).T
-    boot_dists_at_opt = np.mean(np.abs(emp_qb - theo_qb), axis=1)
-    ci_low, ci_high = np.percentile(boot_dists_at_opt, [16, 84])
+    distances_at_optimum = _bootstrap_quantile_distances(
+        simulated_best[valid_best],
+        shape_refit_best[valid_best, np.newaxis],
+        scale_refit_best[valid_best, np.newaxis],
+        probabilities,
+    )
+    band_low, band_high = np.percentile(distances_at_optimum, [16, 84])
 
-    in_band = (distances >= ci_low) & (distances <= ci_high) & passed
-    lo = best_local
-    while lo - 1 >= 0 and in_band[lo - 1]:
-        lo -= 1
-    hi = best_local
-    while hi + 1 < len(candidates_q) and in_band[hi + 1]:
-        hi += 1
+    in_band = (distances >= band_low) & (distances <= band_high) & passed
+    range_start = best_index
+    while range_start - 1 >= 0 and in_band[range_start - 1]:
+        range_start -= 1
+    range_end = best_index
+    while range_end + 1 < len(candidate_quantiles) and in_band[range_end + 1]:
+        range_end += 1
 
-    q_range = (float(candidates_q[lo]), float(candidates_q[hi]))
-    val_range = (
-        float(np.quantile(z_series, q_range[0])),
-        float(np.quantile(z_series, q_range[1])),
+    range_quantiles = (float(candidate_quantiles[range_start]), float(candidate_quantiles[range_end]))
+    range_values = (
+        float(np.quantile(standardised, range_quantiles[0])),
+        float(np.quantile(standardised, range_quantiles[1])),
     )
 
     return TailsResult(
-        threshold=best_val,
-        threshold_quantile=float(best_q),
-        threshold_range=val_range,
-        threshold_range_quantile=q_range,
-        knee_quantile=knee_q,
+        threshold=float(best_threshold),
+        threshold_quantile=float(best_quantile),
+        threshold_range=range_values,
+        threshold_range_quantile=range_quantiles,
+        knee_quantile=knee_quantile,
         q_lower=q_lower,
-        candidates_quantile=candidates_q,
+        candidates_quantile=candidate_quantiles,
         distances=distances,
         ad_pvalues=ad_pvalues,
-        n_events=n_events_arr,
+        n_events=n_events,
         passed_filter=passed,
         fallback_used=False,
         diagnostics={
-            "ci_band": (float(ci_low), float(ci_high)),
-            "best_distance": float(best_dist),
+            "ci_band": (float(band_low), float(band_high)),
+            "best_distance": float(distances[best_index]),
             "n_years": n_years,
-            **_filter_diag,
+            **filter_diagnostics,
         },
     )
 
 
 def compute_tails_thresholds_for_all_zones(
-    ds_reference: xr.DataArray,
+    reference_data: xr.DataArray,
     time_dim: str = "time",
     zone_dim: str = "zone",
     invert: bool = False,
     threshold_type: str = "yearly",
-    q_min_baseline: float = 0.95,
+    min_quantile: float = 0.95,
     quantile_step: float = 0.001,
     n_bootstrap: int = 199,
-    ad_p_threshold: float = 0.05,
+    p_value_threshold: float = 0.05,
     min_events_per_year: float = 1.0,
     random_seed: int = 0,
 ) -> "tuple[xr.DataArray, xr.DataArray, xr.DataArray, xr.DataArray]":
-    """Vectorised wrapper to run TAILS threshold identification across all zones.
-
-    Mirrors the calling convention of ``compute_evt_thresholds_for_all_zones``.
-    ``years`` is derived directly from ``ds_reference[time_dim]`` so the
-    underlying calendar is respected automatically.
+    """Run :func:`find_tails_threshold` for every zone.
 
     Parameters
     ----------
-    ds_reference :
-        DataArray with at least a ``time_dim`` and a ``zone_dim`` dimension.
-    time_dim, zone_dim :
-        Dimension names in ``ds_reference``.
-    invert, threshold_type, q_min_baseline, quantile_step, n_bootstrap,
-    ad_p_threshold, min_events_per_year, random_seed :
-        Passed through to ``find_tails_threshold``.
+    reference_data : xarray.DataArray
+        Reference-period indicator with ``time_dim`` and ``zone_dim`` dimensions.
+        Non-finite values are dropped per zone; years are taken from ``time_dim``.
+    time_dim : str, default "time"
+        Name of the time dimension.
+    zone_dim : str, default "zone"
+        Name of the zone dimension.
+    invert, threshold_type, min_quantile, quantile_step, n_bootstrap, p_value_threshold, min_events_per_year, random_seed
+        Passed to :func:`find_tails_threshold`.
 
     Returns
     -------
-    da_thresholds :
-        TAILS threshold value (in Z-normalised units) for each zone.
-    da_threshold_pct :
-        Empirical percentile (0–100) of the threshold within the finite
-        (non-NaN) values of the zone's Z-normalised series.  NaN entries
-        are stripped before both threshold finding and percentile computation,
-        matching the convention of ``compute_evt_thresholds_for_all_zones``.
-    da_threshold_range :
-        (zone, bound) DataArray with the lower/upper edge of the
-        indistinguishable threshold range T* (eq. 9).  NaN on fallback.
-    da_threshold_range_pct :
-        (zone, bound) DataArray with T* expressed as empirical percentiles.
-        NaN on fallback.
+    thresholds : xarray.DataArray
+        Threshold per zone in standardised units (name ``tails_threshold``).
+    threshold_percentiles : xarray.DataArray
+        Empirical percentile (0-100) of each threshold within the zone's standardised
+        series (name ``tails_threshold_pct``).
+    threshold_range : xarray.DataArray
+        ``(zone, bound)`` lower and upper edge of the indistinguishable range, in
+        standardised units; NaN on fallback (name ``tails_threshold_range``).
+    threshold_range_percentiles : xarray.DataArray
+        ``(zone, bound)`` quantile levels of that range times 100; NaN on fallback
+        (name ``tails_threshold_range_pct``).
     """
-    threshold_dict: dict = {}
-    pct_dict: dict = {}
-    range_lo_dict: dict = {}
-    range_hi_dict: dict = {}
-    range_lo_pct_dict: dict = {}
-    range_hi_pct_dict: dict = {}
+    threshold_by_zone: dict = {}
+    percentile_by_zone: dict = {}
+    range_lower: dict = {}
+    range_upper: dict = {}
+    range_lower_percentile: dict = {}
+    range_upper_percentile: dict = {}
 
-    for zone in ds_reference[zone_dim].values:
-        da_zone = ds_reference.sel({zone_dim: zone})
+    for zone in reference_data[zone_dim].values:
+        da_zone = reference_data.sel({zone_dim: zone})
 
-        zone_series = da_zone.values.flatten()
+        zone_values = da_zone.values.flatten()
         zone_years = da_zone[time_dim].dt.year.values
-        if zone_years.shape != zone_series.shape:
+        if zone_years.shape != zone_values.shape:
             zone_years = np.broadcast_to(
                 zone_years.reshape(da_zone[time_dim].size, *([1] * (da_zone.ndim - 1))),
                 da_zone.shape,
             ).flatten()
 
-        valid_mask = np.isfinite(zone_series)
-        zone_series = zone_series[valid_mask]
-        zone_years = zone_years[valid_mask]
+        finite = np.isfinite(zone_values)
+        zone_values = zone_values[finite]
+        zone_years = zone_years[finite]
 
         result = find_tails_threshold(
-            zone_series,
+            zone_values,
             years=zone_years,
             invert=invert,
             threshold_type=threshold_type,
-            q_min_baseline=q_min_baseline,
+            min_quantile=min_quantile,
             quantile_step=quantile_step,
             n_bootstrap=n_bootstrap,
-            ad_p_threshold=ad_p_threshold,
+            p_value_threshold=p_value_threshold,
             min_events_per_year=min_events_per_year,
             random_seed=random_seed,
         )
 
-        threshold_dict[zone] = result.threshold
+        threshold_by_zone[zone] = result.threshold
         if result.threshold is not None:
-            transformed = -zone_series if invert else zone_series.astype(float)
-            z_series_for_pct = _z_normalize(transformed, zone_years, threshold_type)
-            pct_dict[zone] = float(np.nanmean(z_series_for_pct <= result.threshold) * 100)
+            transformed = -zone_values if invert else zone_values.astype(float)
+            standardised = _z_normalize(transformed, zone_years, threshold_type)
+            percentile_by_zone[zone] = float(np.nanmean(standardised <= result.threshold) * 100)
         else:
-            pct_dict[zone] = float("nan")
+            percentile_by_zone[zone] = float("nan")
         if result.threshold_range is not None:
-            range_lo_dict[zone], range_hi_dict[zone] = result.threshold_range
+            range_lower[zone], range_upper[zone] = result.threshold_range
         else:
-            range_lo_dict[zone], range_hi_dict[zone] = float("nan"), float("nan")
+            range_lower[zone], range_upper[zone] = float("nan"), float("nan")
         if result.threshold_range_quantile is not None:
-            range_lo_pct_dict[zone] = result.threshold_range_quantile[0] * 100.0
-            range_hi_pct_dict[zone] = result.threshold_range_quantile[1] * 100.0
+            range_lower_percentile[zone] = result.threshold_range_quantile[0] * 100.0
+            range_upper_percentile[zone] = result.threshold_range_quantile[1] * 100.0
         else:
-            range_lo_pct_dict[zone] = float("nan")
-            range_hi_pct_dict[zone] = float("nan")
+            range_lower_percentile[zone] = float("nan")
+            range_upper_percentile[zone] = float("nan")
 
-    _zones = list(threshold_dict.keys())
-    da_thresholds = xr.DataArray(
-        list(threshold_dict.values()),
-        coords={zone_dim: _zones},
+    zones = list(threshold_by_zone.keys())
+    thresholds = xr.DataArray(
+        list(threshold_by_zone.values()),
+        coords={zone_dim: zones},
         dims=[zone_dim],
         name="tails_threshold",
     )
-    da_threshold_pct = xr.DataArray(
-        list(pct_dict.values()),
-        coords={zone_dim: _zones},
+    threshold_percentiles = xr.DataArray(
+        list(percentile_by_zone.values()),
+        coords={zone_dim: zones},
         dims=[zone_dim],
         name="tails_threshold_pct",
     )
-    da_threshold_range = xr.DataArray(
-        np.array([[range_lo_dict[z], range_hi_dict[z]] for z in _zones]),
-        coords={zone_dim: _zones, "bound": ["lower", "upper"]},
+    threshold_range = xr.DataArray(
+        np.array([[range_lower[zone], range_upper[zone]] for zone in zones]),
+        coords={zone_dim: zones, "bound": ["lower", "upper"]},
         dims=[zone_dim, "bound"],
         name="tails_threshold_range",
     )
-    da_threshold_range_pct = xr.DataArray(
-        np.array([[range_lo_pct_dict[z], range_hi_pct_dict[z]] for z in _zones]),
-        coords={zone_dim: _zones, "bound": ["lower", "upper"]},
+    threshold_range_percentiles = xr.DataArray(
+        np.array([[range_lower_percentile[zone], range_upper_percentile[zone]] for zone in zones]),
+        coords={zone_dim: zones, "bound": ["lower", "upper"]},
         dims=[zone_dim, "bound"],
         name="tails_threshold_range_pct",
     )
-
-    return da_thresholds, da_threshold_pct, da_threshold_range, da_threshold_range_pct
+    return thresholds, threshold_percentiles, threshold_range, threshold_range_percentiles
 
 
 # ---------------------------------------------------------------------------
-# Deficit floor + coverage gate (degenerate-threshold handling)
+# Deficit floor and coverage
 # ---------------------------------------------------------------------------
 
-# Minimum fraction of reference-period hours that must be in genuine deficit
-# (residual load > 0) for an "extreme deficit" regime to be considered to exist.
-# Sized from the CERRA reference distribution: surplus-dominated zones (e.g.
-# Nordic, ~2.5 % positive hours) fall far below this, while every deficit-prone
-# zone sits at >=31 % even seasonally — so 5 % cleanly separates the two.
+#: Minimum fraction of reference-period steps with residual load > 0 for a zone (or
+#: zone-season) to have a genuine deficit regime. In the CERRA reference,
+#: surplus-dominated zones (e.g. Nordic, about 2.5 % positive steps) fall far below it
+#: and every deficit-prone zone is at 31 % or more, even per season.
 DEFAULT_MIN_POSITIVE_FRACTION = 0.05
 
 
 def _apply_deficit_floor(
     threshold_gwh: float,
-    rl_values: np.ndarray,
+    residual_load: np.ndarray,
     min_positive_fraction: float = DEFAULT_MIN_POSITIVE_FRACTION,
 ) -> "tuple[float, bool, float]":
-    """Floor an extreme-event threshold at genuine deficit (RL > 0) and flag degeneracy.
+    """Floor a threshold at zero and flag zones without a deficit regime.
 
-    An "extreme energy event" must at minimum be a real supply deficit (demand
-    exceeds all in-zone generation + storage). For deficit-prone zones the tail
-    threshold is already well above 0, so the floor is a no-op. For
-    surplus-dominated zones (e.g. hydro-rich Nordic) the unconstrained tail can
-    land at or below 0 GWh — a physically empty "extreme" — which this floor
-    removes.
+    An extreme event must at least be a supply deficit (residual load > 0). For
+    deficit-prone zones the floor has no effect; for surplus-dominated zones it
+    replaces a threshold at or below zero.
 
     Parameters
     ----------
-    threshold_gwh :
-        Candidate threshold in GWh (original residual-load units).
-    rl_values :
-        1-D reference-period residual-load values for the zone (or zone-season),
-        in the same units, used to measure the positive (deficit) fraction.
-    min_positive_fraction :
-        Minimum fraction of hours in deficit for a non-degenerate regime.
+    threshold_gwh : float
+        Candidate threshold (GWh per step).
+    residual_load : numpy.ndarray
+        1-D reference-period residual load of the zone (or zone-season), same units.
+    min_positive_fraction : float, default DEFAULT_MIN_POSITIVE_FRACTION
+        Minimum fraction of finite values above zero for a non-degenerate regime.
 
     Returns
     -------
-    floored_threshold :
-        ``max(threshold_gwh, 0.0)``.
-    is_degenerate :
-        True when the zone has too few deficit hours (positive fraction below
-        ``min_positive_fraction``) or the raw threshold was already <= 0.
-    positive_fraction :
-        Fraction of finite values with RL > 0.
+    floored_threshold : float
+        ``max(threshold_gwh, 0)``.
+    is_degenerate : bool
+        True when the positive fraction is below ``min_positive_fraction`` or the
+        threshold is at or below zero.
+    positive_fraction : float
+        Fraction of finite values above zero (0 if there are none).
     """
-    finite = rl_values[np.isfinite(rl_values)]
+    finite = residual_load[np.isfinite(residual_load)]
     positive_fraction = float(np.mean(finite > 0)) if finite.size else 0.0
-    floored = max(float(threshold_gwh), 0.0)
-    is_degenerate = (
-        positive_fraction < min_positive_fraction or float(threshold_gwh) <= 0.0
+    floored_threshold = max(float(threshold_gwh), 0.0)
+    is_degenerate = positive_fraction < min_positive_fraction or float(threshold_gwh) <= 0.0
+    return floored_threshold, is_degenerate, positive_fraction
+
+
+def _coverage_row(zone_key, season, threshold, values, min_positive_fraction) -> dict:
+    """One row of :func:`diagnose_threshold_coverage`.
+
+    Parameters
+    ----------
+    zone_key : str
+        Zone label.
+    season : str
+        Season label, or ``"ALL"``.
+    threshold : float
+        Threshold to annotate; NaN if none was given.
+    values : numpy.ndarray
+        Residual-load values of the zone (or zone-season).
+    min_positive_fraction : float
+        Passed to :func:`_apply_deficit_floor`.
+
+    Returns
+    -------
+    dict
+        The row; a NaN threshold is evaluated as 0 for the degeneracy flag.
+    """
+    floored_threshold, degenerate, positive_fraction = _apply_deficit_floor(
+        threshold if np.isfinite(threshold) else 0.0, values, min_positive_fraction
     )
-    return floored, is_degenerate, positive_fraction
+    return {
+        "zone": zone_key, "season": season,
+        "positive_fraction": positive_fraction,
+        "threshold_gwh": threshold,
+        "threshold_floored_gwh": floored_threshold if np.isfinite(threshold) else float("nan"),
+        "degenerate": degenerate,
+    }
 
 
 def diagnose_threshold_coverage(
-    da_rl: xr.DataArray,
+    residual_load: xr.DataArray,
     thresholds=None,
     zone_dim: str = "zone",
     season_map: "dict[int, str] | None" = None,
     season_order: "list[str] | None" = None,
     min_positive_fraction: float = DEFAULT_MIN_POSITIVE_FRACTION,
 ) -> pd.DataFrame:
-    """Report deficit coverage and threshold degeneracy per zone (and season).
+    """Tabulate the deficit fraction and threshold degeneracy per zone (and season).
 
-    Use this as a notebook diagnostic to see which zones have a genuine extreme
-    deficit regime. A zone whose ``positive_fraction`` falls below
-    ``min_positive_fraction`` has essentially no deficit tail; its TAILS/EVT
-    threshold is degenerate (near or below 0 GWh) and it should be excluded from
-    cross-zone tail comparisons.
+    A zone whose positive fraction is below ``min_positive_fraction`` has no deficit
+    tail; its threshold is degenerate and it should be left out of cross-zone tail
+    comparisons.
 
     Parameters
     ----------
-    da_rl :
-        Reference-period residual load with a ``zone_dim`` (and ``time``) dim.
-    thresholds :
-        Optional thresholds to annotate. Either a zone-indexed ``xr.DataArray``
-        (annual) or a ``{zone: {season: float}}`` mapping (seasonal). When given
-        with ``season_map``, the seasonal mapping is reported per season.
-    zone_dim, season_map, season_order, min_positive_fraction :
-        See module/usage notes.
+    residual_load : xarray.DataArray
+        Reference-period residual load with a ``zone_dim`` dimension (and ``time``
+        when ``season_map`` is given).
+    thresholds : xarray.DataArray or dict, optional
+        Zone-indexed DataArray (used when ``season_map`` is None) or a
+        ``{zone: {season: threshold}}`` mapping (used when ``season_map`` is given).
+    zone_dim : str, default "zone"
+        Name of the zone dimension.
+    season_map : dict, optional
+        Mapping ``calendar month -> season label``. When given, one row per
+        (zone, season) is reported.
+    season_order : list of str, optional
+        Seasons to report, in order; defaults to the sorted labels of ``season_map``.
+    min_positive_fraction : float, default DEFAULT_MIN_POSITIVE_FRACTION
+        Passed to :func:`_apply_deficit_floor`.
 
     Returns
     -------
     pandas.DataFrame
-        One row per zone (or zone-season) with positive_fraction, threshold_gwh,
-        floored threshold, and the ``degenerate`` flag.
+        Columns ``zone``, ``season`` (``"ALL"`` without ``season_map``),
+        ``positive_fraction``, ``threshold_gwh``, ``threshold_floored_gwh`` and
+        ``degenerate``.
     """
     rows = []
-    zones = list(da_rl[zone_dim].values)
-    times = pd.DatetimeIndex(da_rl["time"].values) if "time" in da_rl.dims else None
+    times = pd.DatetimeIndex(residual_load["time"].values) if "time" in residual_load.dims else None
 
-    for z in zones:
-        zk = str(z)
-        x_all = da_rl.sel({zone_dim: z}).values.flatten()
+    for zone in list(residual_load[zone_dim].values):
+        zone_key = str(zone)
+        zone_values = residual_load.sel({zone_dim: zone}).values.flatten()
         if season_map is None:
-            thr = float("nan")
+            threshold = float("nan")
             if isinstance(thresholds, xr.DataArray):
-                thr = float(thresholds.sel({zone_dim: z}).values)
-            floored, degenerate, pos = _apply_deficit_floor(
-                thr if np.isfinite(thr) else 0.0, x_all, min_positive_fraction
-            )
-            rows.append({
-                "zone": zk, "season": "ALL",
-                "positive_fraction": pos,
-                "threshold_gwh": thr,
-                "threshold_floored_gwh": floored if np.isfinite(thr) else float("nan"),
-                "degenerate": degenerate,
-            })
+                threshold = float(thresholds.sel({zone_dim: zone}).values)
+            rows.append(_coverage_row(zone_key, "ALL", threshold, zone_values, min_positive_fraction))
         else:
-            _seasons = season_order or sorted(set(season_map.values()))
-            seas = np.array([season_map[m] for m in times.month])
-            for s in _seasons:
-                m = seas == s
-                x_s = x_all[m]
-                thr = float("nan")
+            seasons = season_order or sorted(set(season_map.values()))
+            season_of_step = np.array([season_map[month] for month in times.month])
+            for season in seasons:
+                threshold = float("nan")
                 if isinstance(thresholds, dict):
-                    thr = float(thresholds.get(zk, {}).get(s, float("nan")))
-                floored, degenerate, pos = _apply_deficit_floor(
-                    thr if np.isfinite(thr) else 0.0, x_s, min_positive_fraction
-                )
-                rows.append({
-                    "zone": zk, "season": s,
-                    "positive_fraction": pos,
-                    "threshold_gwh": thr,
-                    "threshold_floored_gwh": floored if np.isfinite(thr) else float("nan"),
-                    "degenerate": degenerate,
-                })
+                    threshold = float(thresholds.get(zone_key, {}).get(season, float("nan")))
+                rows.append(_coverage_row(zone_key, season, threshold,
+                                          zone_values[season_of_step == season], min_positive_fraction))
 
     return pd.DataFrame(rows)
 
 
 # ---------------------------------------------------------------------------
-# Fixed-percentile threshold selection
+# Fixed percentile
 # ---------------------------------------------------------------------------
 
-# Default percentile (0-100) of the positive residual-load distribution used by
-# the ``"PERCENTILE"`` method. The 95th percentile of positive RL is a simple,
-# transparent tail cut-off with no distributional-fit assumptions.
+#: Default percentile (0-100) of the positive residual load for the "PERCENTILE" method.
 DEFAULT_FIXED_PERCENTILE = 95.0
 
 
 def find_fixed_percentile_threshold(
-    zone_data,
+    residual_load,
     percentile: float = DEFAULT_FIXED_PERCENTILE,
 ) -> float:
-    """Fixed-percentile threshold of the positive residual-load distribution.
-
-    A model-free alternative to the EVT/TAILS tail-selection engines: the
-    threshold is simply the ``percentile``-th percentile of the strictly
-    positive (deficit) residual-load values. Non-positive and non-finite values
-    are dropped first so the percentile is always taken over the genuine
-    deficit tail, matching the deficit-floor convention used elsewhere.
+    """Fixed percentile of the strictly positive residual load.
 
     Parameters
     ----------
-    zone_data :
-        1-D (or flattenable) array of residual loads for the reference period.
-    percentile :
-        Percentile in [0, 100] of the positive-RL distribution (default 95).
+    residual_load : array_like
+        Reference-period residual load; flattened, and non-finite and non-positive
+        values are dropped.
+    percentile : float, default DEFAULT_FIXED_PERCENTILE
+        Percentile in [0, 100].
 
     Returns
     -------
     float
-        Threshold in the original (GWh) units, or NaN if there are no positive
-        values to compute a percentile from.
+        The threshold in the input units, or NaN if there are no positive values.
     """
-    x = np.asarray(zone_data, dtype=float).ravel()
-    positive_rl = x[np.isfinite(x) & (x > 0)]
-    if positive_rl.size == 0:
+    values = np.asarray(residual_load, dtype=float).ravel()
+    positive_values = values[np.isfinite(values) & (values > 0)]
+    if positive_values.size == 0:
         return float("nan")
-    return float(np.percentile(positive_rl, percentile))
+    return float(np.percentile(positive_values, percentile))
 
 
 # ---------------------------------------------------------------------------
-# Unified threshold calibration (method-agnostic wrappers)
+# Method-agnostic calibration
 # ---------------------------------------------------------------------------
 
 
 def compute_active_threshold(
-    da_rl: xr.DataArray,
+    residual_load: xr.DataArray,
     method: str,
     zone_dim: str = "zone",
     p_value_threshold: float = 0.1,
     percentile: float = DEFAULT_FIXED_PERCENTILE,
     min_positive_fraction: float = DEFAULT_MIN_POSITIVE_FRACTION,
 ) -> xr.DataArray:
-    """Compute the extreme-event threshold for all zones using the chosen method.
+    """Annual extreme-event threshold per zone with the chosen method.
 
-    Thresholds are floored at genuine deficit (RL > 0): an extreme energy event
-    must at minimum be a real supply deficit. This is a no-op for deficit-prone
-    zones (tail already well above 0) and removes the degenerate near-/sub-zero
-    "extreme" of surplus-dominated zones (e.g. hydro-rich Nordic). Zones with a
-    deficit fraction below ``min_positive_fraction`` are flagged as degenerate
-    via ``result.attrs`` (and a warning) so callers can exclude them from
-    cross-zone tail comparisons. See :func:`diagnose_threshold_coverage`.
+    Each threshold is floored at zero and zones without a deficit regime are flagged
+    (see :func:`_apply_deficit_floor`); every flagged zone also emits a warning.
 
     Parameters
     ----------
-    da_rl :
-        Reference-period residual load DataArray with a ``zone_dim`` dimension.
-    method :
-        ``"EVT"`` for Peaks-Over-Threshold / GPD stability test,
-        ``"TAILS"`` for TAILS automated distance minimisation, or
-        ``"PERCENTILE"`` for a fixed percentile of the positive-RL distribution.
-    zone_dim :
-        Name of the zone dimension (default ``"zone"``).
-    p_value_threshold :
-        Passed to :func:`find_evt_pot_threshold` when ``method="EVT"``.
-    percentile :
-        Percentile (0-100) of the positive-RL distribution used when
-        ``method="PERCENTILE"`` (default 95).
-    min_positive_fraction :
-        Minimum fraction of reference-period hours in deficit (RL > 0) for a
-        non-degenerate extreme regime (default 5 %).
+    residual_load : xarray.DataArray
+        Reference-period residual load with a ``zone_dim`` dimension.
+    method : {"PERCENTILE", "EVT", "TAILS"}
+        ``"PERCENTILE"``: :func:`find_fixed_percentile_threshold`. ``"EVT"``:
+        :func:`find_evt_pot_threshold`. ``"TAILS"``: :func:`find_tails_threshold` with
+        yearly standardisation; the selected percentile of the standardised series is
+        mapped back to the same percentile of the raw values.
+    zone_dim : str, default "zone"
+        Name of the zone dimension.
+    p_value_threshold : float, default 0.1
+        Significance level for ``"EVT"``.
+    percentile : float, default DEFAULT_FIXED_PERCENTILE
+        Percentile (0-100) of the positive residual load for ``"PERCENTILE"``.
+    min_positive_fraction : float, default DEFAULT_MIN_POSITIVE_FRACTION
+        Minimum deficit fraction for a non-degenerate zone.
 
     Returns
     -------
-    xr.DataArray
-        Zone-indexed DataArray of thresholds in the original (GWh) units of
-        ``da_rl``. ``.attrs['degenerate_zones']`` lists flagged zones and
-        ``.attrs['positive_fraction']`` maps zone -> deficit fraction.
+    xarray.DataArray
+        Threshold per zone (name ``threshold_gwh``) in the input units. ``attrs``
+        holds ``degenerate_zones`` (list of zone labels), ``positive_fraction``
+        (zone -> fraction) and ``min_positive_fraction``.
+
+    Raises
+    ------
+    ValueError
+        If ``method`` is unknown.
     """
+    zones = residual_load[zone_dim].values
+
+    def zone_values(zone):
+        """All residual-load values of one zone, flattened."""
+        return residual_load.sel({zone_dim: zone}).values.flatten()
+
     if method == "EVT":
-        da_thr, _ = compute_evt_thresholds_for_all_zones(
-            da_rl, p_value_threshold=p_value_threshold, country_dim=zone_dim
+        evt_thresholds, _ = compute_evt_thresholds_for_all_zones(
+            residual_load, p_value_threshold=p_value_threshold, zone_dim=zone_dim
         )
-        raw = {str(z): float(da_thr.sel({zone_dim: z}).values) for z in da_rl[zone_dim].values}
+        raw = {str(zone): float(evt_thresholds.sel({zone_dim: zone}).values) for zone in zones}
     elif method == "TAILS":
-        _, da_pct, _, _ = compute_tails_thresholds_for_all_zones(
-            da_rl, zone_dim=zone_dim, threshold_type="yearly"
+        _, tails_percentiles, _, _ = compute_tails_thresholds_for_all_zones(
+            residual_load, zone_dim=zone_dim, threshold_type="yearly"
         )
         raw = {
-            str(z): float(np.nanpercentile(
-                da_rl.sel({zone_dim: z}).values.flatten(),
-                float(da_pct.sel({zone_dim: z}).values),
+            str(zone): float(np.nanpercentile(
+                zone_values(zone), float(tails_percentiles.sel({zone_dim: zone}).values)
             ))
-            for z in da_rl[zone_dim].values
+            for zone in zones
         }
     elif method == "PERCENTILE":
-        raw = {
-            str(z): find_fixed_percentile_threshold(
-                da_rl.sel({zone_dim: z}).values.flatten(), percentile
-            )
-            for z in da_rl[zone_dim].values
-        }
+        raw = {str(zone): find_fixed_percentile_threshold(zone_values(zone), percentile) for zone in zones}
     else:
         raise ValueError(
             f"Unknown method {method!r}. Use 'EVT', 'TAILS' or 'PERCENTILE'."
         )
 
-    # Deficit floor + coverage gate (applies to both methods).
     floored, degenerate_zones, positive_fraction = {}, [], {}
-    for z in da_rl[zone_dim].values:
-        zk = str(z)
-        thr_f, is_deg, pos = _apply_deficit_floor(
-            raw[zk], da_rl.sel({zone_dim: z}).values.flatten(), min_positive_fraction
+    for zone in zones:
+        zone_key = str(zone)
+        floored_threshold, is_degenerate, zone_positive_fraction = _apply_deficit_floor(
+            raw[zone_key], zone_values(zone), min_positive_fraction
         )
-        floored[zk] = thr_f
-        positive_fraction[zk] = pos
-        if is_deg:
-            degenerate_zones.append(zk)
+        floored[zone_key] = floored_threshold
+        positive_fraction[zone_key] = zone_positive_fraction
+        if is_degenerate:
+            degenerate_zones.append(zone_key)
             warnings.warn(
-                f"[{method}] Zone {zk!r} has a degenerate extreme threshold "
-                f"(raw={raw[zk]:.1f} GWh, deficit fraction={pos:.1%} "
-                f"< {min_positive_fraction:.0%}); floored to {thr_f:.1f} GWh. "
+                f"[{method}] Zone {zone_key!r} has a degenerate extreme threshold "
+                f"(raw={raw[zone_key]:.1f} GWh, deficit fraction={zone_positive_fraction:.1%} "
+                f"< {min_positive_fraction:.0%}); floored to {floored_threshold:.1f} GWh. "
                 f"Exclude from cross-zone tail comparisons.",
                 stacklevel=2,
             )
 
-    da_out = xr.DataArray(
-        [floored[str(z)] for z in da_rl[zone_dim].values],
-        coords={zone_dim: da_rl[zone_dim].values},
+    thresholds = xr.DataArray(
+        [floored[str(zone)] for zone in zones],
+        coords={zone_dim: zones},
         dims=[zone_dim],
         name="threshold_gwh",
     )
-    da_out.attrs["degenerate_zones"] = degenerate_zones
-    da_out.attrs["positive_fraction"] = positive_fraction
-    da_out.attrs["min_positive_fraction"] = min_positive_fraction
-    return da_out
+    thresholds.attrs["degenerate_zones"] = degenerate_zones
+    thresholds.attrs["positive_fraction"] = positive_fraction
+    thresholds.attrs["min_positive_fraction"] = min_positive_fraction
+    return thresholds
 
 
 def calibrate_seasonal_active_thresholds(
-    da_rl_ref: xr.DataArray,
+    reference_residual_load: xr.DataArray,
     zones,
     season_order: "list[str]",
     season_months: "dict[str, list[int]]",
@@ -965,99 +1043,96 @@ def calibrate_seasonal_active_thresholds(
     percentile: float = DEFAULT_FIXED_PERCENTILE,
     min_positive_fraction: float = DEFAULT_MIN_POSITIVE_FRACTION,
 ) -> "tuple[dict, dict]":
-    """Calibrate per-season thresholds for all zones using the chosen method.
+    """Per-season extreme-event threshold for every zone with the chosen method.
 
-    As in :func:`compute_active_threshold`, each (zone, season) threshold is
-    floored at genuine deficit (RL > 0) — a no-op for deficit-prone
-    zone-seasons and a correction for surplus-dominated ones (e.g. Nordic JJA,
-    whose unconstrained TAILS threshold is negative). Degenerate zone-seasons
-    (deficit fraction < ``min_positive_fraction``) emit a warning.
+    Thresholds are computed on the finite values of each (zone, season), floored at
+    zero, and degenerate zone-seasons emit a warning (see :func:`_apply_deficit_floor`;
+    the deficit fraction is measured on all values of the season).
 
     Parameters
     ----------
-    da_rl_ref :
-        Reference-period residual load DataArray with ``zone_dim`` and ``time``.
-    zones :
+    reference_residual_load : xarray.DataArray
+        Reference-period residual load with ``zone_dim`` and ``time`` dimensions.
+    zones : sequence
         Zone coordinate values.
-    season_order :
-        Season names in display order (e.g. ``["DJF", "MAM", "JJA", "SON"]``).
-    season_months :
-        Mapping ``{season: [month_ints]}``.
-    method :
-        ``"EVT"``, ``"TAILS"`` or ``"PERCENTILE"``.
-    zone_dim :
-        Name of the zone dimension (default ``"zone"``).
-    percentile :
-        Percentile (0-100) of the season's positive-RL distribution used when
-        ``method="PERCENTILE"`` (default 95).
-    min_positive_fraction :
-        Minimum deficit fraction for a non-degenerate seasonal regime (default 5 %).
+    season_order : list of str
+        Season names, e.g. ``["DJF", "MAM", "JJA", "SON"]``.
+    season_months : dict
+        Mapping ``season -> list of calendar months``.
+    method : {"PERCENTILE", "EVT", "TAILS"}
+        As in :func:`compute_active_threshold`; any value other than ``"EVT"`` and
+        ``"PERCENTILE"`` runs TAILS. ``"EVT"`` uses the default significance level of
+        :func:`find_evt_pot_threshold`.
+    zone_dim : str, default "zone"
+        Name of the zone dimension.
+    percentile : float, default DEFAULT_FIXED_PERCENTILE
+        Percentile (0-100) of the season's positive residual load for ``"PERCENTILE"``.
+    min_positive_fraction : float, default DEFAULT_MIN_POSITIVE_FRACTION
+        Minimum deficit fraction for a non-degenerate zone-season.
 
     Returns
     -------
-    thresholds :
-        ``{zone: {season: float}}`` — threshold in GWh for each (zone, season),
-        floored at 0.
-    percentiles :
-        ``{zone: {season: float}}`` — empirical percentile (0–100) of each threshold
-        within the season's own reference-period RL distribution.
+    thresholds : dict
+        ``{zone: {season: threshold}}`` in the input units, floored at zero; zone keys
+        are strings.
+    percentiles : dict
+        ``{zone: {season: percentile}}``: empirical percentile (0-100) of the unfloored
+        threshold among the season's finite values.
     """
-    times_ref = pd.DatetimeIndex(da_rl_ref["time"].values)
-    years_ref  = times_ref.year.values
+    times = pd.DatetimeIndex(reference_residual_load["time"].values)
+    years = times.year.values
 
     thresholds: dict = {}
     percentiles: dict = {}
 
     for zone in zones:
-        zk = str(zone)
-        thresholds[zk] = {}
-        percentiles[zk] = {}
-        rl_zone = da_rl_ref.sel({zone_dim: zone}).values.flatten()
+        zone_key = str(zone)
+        thresholds[zone_key] = {}
+        percentiles[zone_key] = {}
+        zone_values = reference_residual_load.sel({zone_dim: zone}).values.flatten()
 
         for season in season_order:
-            mask         = np.isin(times_ref.month, season_months[season])
-            season_rl    = rl_zone[mask]
-            season_years = years_ref[mask]
+            in_season = np.isin(times.month, season_months[season])
+            season_values = zone_values[in_season]
+            season_years = years[in_season]
 
-            # Strip NaN (e.g. from a prior .where() filter applied by the caller)
-            # for threshold finding and percentile computation.  The full season_rl
-            # is kept for _apply_deficit_floor so positive_fraction is correct.
-            valid        = np.isfinite(season_rl)
-            season_rl_v  = season_rl[valid]
-            season_yrs_v = season_years[valid]
+            finite = np.isfinite(season_values)
+            season_values_finite = season_values[finite]
+            season_years_finite = season_years[finite]
 
             if method == "EVT":
-                thr = find_evt_pot_threshold(season_rl_v)
-                pct = float(np.mean(season_rl_v <= thr) * 100)
+                threshold = find_evt_pot_threshold(season_values_finite)
+                threshold_percentile = float(np.mean(season_values_finite <= threshold) * 100)
             elif method == "PERCENTILE":
-                thr = find_fixed_percentile_threshold(season_rl_v, percentile)
-                pct = (
-                    float(np.mean(season_rl_v <= thr) * 100)
-                    if np.isfinite(thr) else float("nan")
+                threshold = find_fixed_percentile_threshold(season_values_finite, percentile)
+                threshold_percentile = (
+                    float(np.mean(season_values_finite <= threshold) * 100)
+                    if np.isfinite(threshold) else float("nan")
                 )
-            else:  # TAILS
+            else:
                 result = find_tails_threshold(
-                    season_rl_v,
-                    years=season_yrs_v,
+                    season_values_finite,
+                    years=season_years_finite,
                     threshold_type="yearly",
                     random_seed=0,
                 )
-                z_season = _z_normalize(season_rl_v.astype(float), season_yrs_v, "yearly")
-                pct = float(np.nanmean(z_season <= result.threshold) * 100)
-                thr = float(np.nanpercentile(season_rl_v, pct))
+                standardised = _z_normalize(season_values_finite.astype(float), season_years_finite, "yearly")
+                threshold_percentile = float(np.nanmean(standardised <= result.threshold) * 100)
+                threshold = float(np.nanpercentile(season_values_finite, threshold_percentile))
 
-            # Deficit floor + coverage gate (uses full season_rl for positive_fraction).
-            thr_f, is_deg, pos = _apply_deficit_floor(thr, season_rl, min_positive_fraction)
-            if is_deg:
+            floored_threshold, is_degenerate, positive_fraction = _apply_deficit_floor(
+                threshold, season_values, min_positive_fraction
+            )
+            if is_degenerate:
                 warnings.warn(
-                    f"[{method}] Zone {zk!r} season {season!r} has a degenerate "
-                    f"extreme threshold (raw={thr:.1f} GWh, deficit fraction="
-                    f"{pos:.1%} < {min_positive_fraction:.0%}); floored to "
-                    f"{thr_f:.1f} GWh. Exclude from cross-zone tail comparisons.",
+                    f"[{method}] Zone {zone_key!r} season {season!r} has a degenerate "
+                    f"extreme threshold (raw={threshold:.1f} GWh, deficit fraction="
+                    f"{positive_fraction:.1%} < {min_positive_fraction:.0%}); floored to "
+                    f"{floored_threshold:.1f} GWh. Exclude from cross-zone tail comparisons.",
                     stacklevel=2,
                 )
 
-            thresholds[zk][season] = thr_f
-            percentiles[zk][season] = pct
+            thresholds[zone_key][season] = floored_threshold
+            percentiles[zone_key][season] = threshold_percentile
 
     return thresholds, percentiles
