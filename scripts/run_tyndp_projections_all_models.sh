@@ -40,8 +40,7 @@ legacy_thermal=false
 # TYNDP's 'Cooling' is systematically broader than the space cooling the model fits, and its
 # Italy/Spain ordering is inverted relative to every observed year. Because k multiplies the whole
 # series it amplifies the climate TREND by the same factor, so k_cool = 3.55 for Italy drove the
-# South-East zone into threshold saturation (43.7 % of JJA timesteps at +3.0 C). See
-# notebooks/paper_metric_and_target_diagnostics.ipynb.
+# South-East zone into threshold saturation (43.7 % of JJA timesteps at +3.0 C).
 #
 # Set rescale_cooling=true for the upper-bracket sensitivity (cooling pinned to the TYNDP target).
 rescale_cooling=false

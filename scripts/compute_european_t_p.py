@@ -1,55 +1,32 @@
-"""Area-mean European temperature and precipitation per model, at each warming level.
+"""European area-mean temperature, precipitation and runoff per model and warming level.
 
-Feeds Supplementary Fig. S5, which asks how the nine chains differ in mean European climate and how
-much of that they inherit from the five driving GCMs.  Three sources, one table:
+Three sources, one table (``<processed>/european_t_p_by_gwl.csv``):
 
-    gcm    the 5 driving GCMs, RAW, from the cmip5-ng annual archive
-    rcm    the 9 chains, BIAS-CORRECTED — the data every result in the paper is computed from
-    cerra  the reanalysis the correction targets, over its 1991-2020 training period
+    gcm    the CMIP5 ensemble, raw, from the cmip5-ng annual archive (tas, pr)
+    rcm    the chains, bias-corrected, from the warming-level means written by
+           ``compute_climate_means_gwl.py`` (tas, pr, mrro)
+    cerra  the reanalysis the bias correction targets, over 1991-2020 (tas, pr)
 
-Why the RCM side costs nothing
-------------------------------
-``energy/analysis/annual/gwl/mean_gwl_*_climate.nc`` already holds exactly this: per-chain
-bias-corrected 20-year GWL-window means of ``tas`` (K) and ``pr`` (mm d-1) on the analysis grid,
-each chain sliced with its own window.  Written by ``compute_climate_means_gwl.py``.  All that is
-left is an area-weighted spatial mean.
+Area means are cosine-latitude weighted over :data:`EXTENT`. The chains and CERRA are averaged
+over a common valid mask, the cells where CERRA has data (the bias-corrected output is filled
+beyond the CERRA domain by extrapolation); runoff is averaged over land only, because the product
+stores 0 over the sea. The GCMs use the same box without a mask, once their 0-360 longitudes
+are moved to -180-180. Both masks are cached as
+``<processed>/cerra_valid_mask.nc`` and ``<processed>/european_land_mask.nc``, and are reused by
+:func:`~cordex2energy_analysis.pipeline_inputs.european_seasonal_change`.
 
-Why the CERRA side is the expensive one
----------------------------------------
-Both CERRA zarrs are chunked with the ENTIRE time axis in one chunk (``tp`` (13260,20,20), ``2t``
-(107544,20,20,1)), so touching any cell pulls that tile's whole series.  Over the analysis extent
-that is ~10 GB for ``tp`` and ~100 GB for ``2t``, decompression-bound.  Subsampling in time or
-space does not help — the chunk is read either way.  Hence the cache.
+Units follow the bias-corrected product: temperature in degC (converted from K), precipitation
+and runoff in mm d-1 (stored as ``kg m**-2`` per day). CMIP5 ``pr`` is in kg m-2 s-1 and is
+multiplied by 86400.
 
-Two corrections that make the three sources comparable
-------------------------------------------------------
-1. **A common valid mask.**  CERRA is NaN outside its native Lambert domain, but the bias-corrected
-   CORDEX output is NaN-free because the correction script forward/back-filled its borders
-   (``bias_correct_climate_model_data.py:192-216``) — those corners are nearest-neighbour
-   extrapolation, not data.  Averaging each over "its own" valid cells would compare different
-   samples.  The mask is built from CERRA and applied to CERRA and the chains alike.  Over this
-   extent it costs only the far south-east corner.
-2. **cos-latitude weighting**, since all three are regular lat-lon grids.
+Reading CERRA is slow: its zarrs hold the whole time axis in one chunk per tile, so the
+analysis extent reads ~10 GB for ``tp`` and ~100 GB for ``2t``. A run with ``--sources`` replaces
+only those sources' rows of an existing table.
 
-The GCM panel cannot take the 0.1 deg mask (it is 2.5 deg), so it uses the same geographic box with
-cos-lat weights and no mask.  That is a real difference and the figure's caption says so: part of
-the GCM offset from CERRA is resolution, not bias.
-
-A third variable, land-only
----------------------------
-``mrro`` rides along from the same GWL files for S5c, which asks the same question in runoff -- the
-variable ``compute_hydropower.py`` consumes, and so the one behind the Hydro drivers of Figure 3d.
-It is averaged over LAND alone because the product stores 0 over the sea; ``tas`` and ``pr`` keep
-the domain mask.  The CMIP5 side has no runoff counterpart: HadGEM2-ES and EC-EARTH archive no
-``mrro`` at all, so S5c drops the ensemble cloud rather than draw one missing two of five drivers.
-
-Units are those of the bias-corrected product: temperature in degC, precipitation in mm d-1.
-``tp`` is stored as ``kg m**-2``, which IS mm d-1 — the bias-correction script only relabels it, it
-does not scale it.  Do not multiply by 86400 (that is for CORDEX ``pr`` in kg m-2 s-1).
-
-Example:
-    python compute_european_t_p.py --sources gcm rcm      # seconds
-    python compute_european_t_p.py --sources cerra        # the long one
+Examples
+--------
+    python compute_european_t_p.py --sources gcm rcm
+    python compute_european_t_p.py --sources cerra
     python compute_european_t_p.py
 """
 import argparse
@@ -60,14 +37,17 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
+#: The five GCMs driving the chains, with the ensemble member each chain used.
 DRIVING_GCMS = {"CNRM-CM5": "r1i1p1", "HadGEM2-ES": "r1i1p1", "NorESM1-M": "r1i1p1",
                 "MPI-ESM-LR": "r1i1p1", "EC-EARTH": "r12i1p1"}
-# CORDEX institute-prefixed names -> the CMIP5 names cmip5-ng and the warming-level YAML use.
+#: CORDEX institute-prefixed GCM names to the CMIP5 names of cmip5-ng and the warming-level YAML.
 CORDEX_TO_CMIP5 = {"CNRM-CERFACS-CNRM-CM5": "CNRM-CM5", "MOHC-HadGEM2-ES": "HadGEM2-ES",
                    "NCC-NorESM1-M": "NorESM1-M", "MPI-M-MPI-ESM-LR": "MPI-ESM-LR",
                    "ICHEC-EC-EARTH": "EC-EARTH"}
-EXTENT = {"lat": slice(30, 72.6), "lon": slice(-12, 39)}      # the paper's analysis domain
-REFERENCE_PERIOD = ("1991", "2020")                            # CERRA's bias-correction training window
+#: The analysis domain.
+EXTENT = {"lat": slice(30, 72.6), "lon": slice(-12, 39)}
+#: CERRA's bias-correction training window.
+REFERENCE_PERIOD = ("1991", "2020")
 
 parser = argparse.ArgumentParser(description="European mean T and P per model and warming level")
 parser.add_argument("--paths_file", type=str,
@@ -81,14 +61,27 @@ parser.add_argument("--sources", type=str, nargs="+", default=["gcm", "rcm", "ce
                     choices=["gcm", "rcm", "cerra"])
 args = parser.parse_args()
 
-paths = json.load(open(args.paths_file))
+with open(args.paths_file) as handle:
+    paths = json.load(handle)
 processed = Path(paths["path_data_processed"])
 out_path = processed / "european_t_p_by_gwl.csv"
 gwl_dir = processed / "energy" / "analysis" / "annual" / "gwl"
 
 
 def area_mean(field, mask=None):
-    """cos-latitude weighted spatial mean, optionally over a shared valid mask."""
+    """Cosine-latitude weighted spatial mean, optionally over a mask.
+
+    Parameters
+    ----------
+    field : xarray.DataArray
+        Field on ``(lat, lon)``.
+    mask : xarray.DataArray, optional
+        Boolean mask on the same grid.
+
+    Returns
+    -------
+    float
+    """
     weights = np.cos(np.deg2rad(field["lat"]))
     if mask is not None:
         field = field.where(mask)
@@ -99,9 +92,13 @@ def area_mean(field, mask=None):
 def cerra_mask():
     """Cells where CERRA has data, on the 0.1 deg grid, over the analysis extent.
 
-    Cached, because `tp.zarr` holds the whole time axis in one chunk per 20x20 tile: reading a
-    SINGLE timestep over this extent still decompresses ~10 GB. The mask is a fixed geometric
-    footprint, so paying that once and keeping the 40 kB result is the whole point.
+    Read from ``cerra_valid_mask.nc`` if it exists; otherwise built from the first time step of
+    the regridded ``tp`` and written there (reading one step decompresses ~10 GB).
+
+    Returns
+    -------
+    xarray.DataArray
+        Boolean ``cerra_valid`` on ``(lat, lon)``.
     """
     cache = processed / "cerra_valid_mask.nc"
     if cache.exists():
@@ -118,16 +115,22 @@ def cerra_mask():
 
 
 def land_mask(cerra_valid):
-    """Land cells of the analysis extent, on the 0.1 deg grid, inside the CERRA footprint.
+    """Land cells of the analysis extent inside the CERRA footprint, on the 0.1 deg grid.
 
-    Runoff needs this and precipitation does not.  The bias-corrected product stores runoff as
-    exactly 0 over the sea rather than NaN, so a domain mean is (land runoff x land fraction): over
-    this extent that is 0.415 against 0.661 mm d-1, a factor of 1.59.  Precipitation falls on the
-    sea too, so its domain mean is a real quantity and stays as it is.
+    Read from ``european_land_mask.nc`` if it exists; otherwise built from the Natural Earth
+    1:10 m land polygons (regionmask) and written there. Runoff is averaged over this mask
+    because the product stores runoff as 0, not NaN, over the sea; a mask taken from the field
+    itself would also drop land cells with zero runoff.
 
-    Natural Earth rather than a threshold on the field itself: a cell with genuinely zero runoff --
-    karst, the drier south -- is land, and a mask that cannot tell it from the Atlantic would drop
-    exactly the cells the figure is about.  Same coastline source as the country maps.
+    Parameters
+    ----------
+    cerra_valid : xarray.DataArray
+        From :func:`cerra_mask`.
+
+    Returns
+    -------
+    xarray.DataArray
+        Boolean ``european_land`` on ``(lat, lon)``.
     """
     cache = processed / "european_land_mask.nc"
     if cache.exists():
@@ -150,66 +153,79 @@ rows = []
 if "rcm" in args.sources:
     mask = cerra_mask()
     land = land_mask(mask)
-    meta = {m["id"]: m for m in json.load(open(args.models_json))["model_chains"]}
+    with open(args.models_json) as handle:
+        chain_metadata = {chain["id"]: chain for chain in json.load(handle)["model_chains"]}
     for level in args.warming_levels:
         path = gwl_dir / f"mean_gwl_{int(level * 10)}_climate.nc"
-        ds = xr.open_dataset(path).sel(**EXTENT)
-        assert ds["pr"].attrs.get("units") == "mm d-1", f"{path.name}: pr is not mm d-1"
-        assert ds["tas"].attrs.get("units") == "K", f"{path.name}: tas is not K"
-        # `kg m**-2` is this pipeline's label for a daily total, i.e. mm d-1 -- the same relabelling
-        # documented above for CERRA `tp`. Do NOT multiply by 86400: that is for raw CMIP5 `mrro`,
-        # which really is kg m-2 s-1. The land mean lands at ~0.66 mm d-1, which is Europe.
-        assert ds["mrro"].attrs.get("units") == "kg m**-2", f"{path.name}: mrro is not kg m**-2"
-        assert np.array_equal(ds["lat"].values, mask["lat"].values) and \
-               np.array_equal(ds["lon"].values, mask["lon"].values), \
+        means = xr.open_dataset(path).sel(**EXTENT)
+        assert means["pr"].attrs.get("units") == "mm d-1", f"{path.name}: pr is not mm d-1"
+        assert means["tas"].attrs.get("units") == "K", f"{path.name}: tas is not K"
+        # "kg m**-2" is the product's label for a daily total, i.e. mm d-1: no factor 86400.
+        assert means["mrro"].attrs.get("units") == "kg m**-2", f"{path.name}: mrro is not kg m**-2"
+        assert np.array_equal(means["lat"].values, mask["lat"].values) and \
+               np.array_equal(means["lon"].values, mask["lon"].values), \
             "the GWL grid and the CERRA mask are not the same grid"
-        for chain in [str(m) for m in ds["model"].values]:
+        for chain in [str(model) for model in means["model"].values]:
             base = chain[: -len(f"_{args.scenario}")] if chain.endswith(f"_{args.scenario}") else chain
-            info = meta.get(base, {})
+            info = chain_metadata.get(base, {})
             rows.append(dict(source="rcm", model=base, ensemble=info.get("ensemble"),
                              rcm=info.get("rcm", base.split("_")[0]),
                              gcm=CORDEX_TO_CMIP5.get(info.get("gcm"), info.get("gcm")),
                              driving=False, warming_level=level,
-                             tas_degC=area_mean(ds["tas"].sel(model=chain), mask) - 273.15,
-                             pr_mm_per_day=area_mean(ds["pr"].sel(model=chain), mask),
-                             # LAND only, unlike the two above -- see land_mask(). Temperature
-                             # deliberately keeps the domain mask so S5c's x axis is the same
-                             # quantity, and the same nine positions, as S5a's and S5b's.
-                             mrro_mm_per_day=area_mean(ds["mrro"].sel(model=chain), land)))
-        print(f"  rcm  +{level}C  {len(ds['model'])} chains from {path.name}", flush=True)
+                             tas_degC=area_mean(means["tas"].sel(model=chain), mask) - 273.15,
+                             pr_mm_per_day=area_mean(means["pr"].sel(model=chain), mask),
+                             # Land only (see land_mask); temperature keeps the domain mask.
+                             mrro_mm_per_day=area_mean(means["mrro"].sel(model=chain), land)))
+        print(f"  rcm  +{level}C  {len(means['model'])} chains from {path.name}", flush=True)
 
 # ── The CMIP5 ensemble, raw ────────────────────────────────────────────────────
-# The WHOLE ensemble, not just the five drivers: S5's grey cloud is what makes "where do our five
-# sit" answerable, and at ~9.6 MB per annual g025 file the other ~33 models cost minutes.
+# The whole ensemble, not only the five driving GCMs.
 if "gcm" in args.sources:
     import re
     from cordex2energy_analysis.analysis import load_warming_level_periods
     windows = load_warming_level_periods(
         processed / "cmip5_warming_levels_all_ens_1861_1900.yml", args.warming_levels, None)
 
-    def members_with(var):
-        """(model, ensemble) pairs having an annual g025 file for this variable and scenario."""
-        pattern = re.compile(rf"{var}_ann_(.+)_{args.scenario}_(r\d+i\d+p\d+)_g025$")
-        return {m.groups() for path in Path(args.cmip5ng, var).glob(
-            f"{var}_ann_*_{args.scenario}_*_g025.nc") if (m := pattern.match(path.stem))}
+    def members_with(variable):
+        """Runs with an annual g025 file of one variable for the scenario.
 
-    # A run is usable only if it has BOTH variables and a window at EVERY level being plotted —
-    # otherwise a model would appear at some levels and not others and the cloud would be ragged.
+        Parameters
+        ----------
+        variable : str
+            cmip5-ng variable name.
+
+        Returns
+        -------
+        set of tuple
+            ``(model, ensemble)`` pairs.
+        """
+        pattern = re.compile(rf"{variable}_ann_(.+)_{args.scenario}_(r\d+i\d+p\d+)_g025$")
+        return {match.groups() for path in Path(args.cmip5ng, variable).glob(
+            f"{variable}_ann_*_{args.scenario}_*_g025.nc") if (match := pattern.match(path.stem))}
+
+    # A run is usable only with both variables and a window at every requested level.
     usable = sorted(
         members_with("tas") & members_with("pr")
         & {key for key, scenarios in windows.items()
            if set(args.warming_levels) <= set(scenarios.get(args.scenario, {}))})
-    print(f"  gcm  {len(usable)} runs over {len({m for m, _ in usable})} models", flush=True)
-    _missing = [g for g in DRIVING_GCMS if (g, DRIVING_GCMS[g]) not in set(usable)]
-    assert not _missing, f"driving GCM(s) not usable: {_missing}"
+    print(f"  gcm  {len(usable)} runs over {len({model for model, _ in usable})} models", flush=True)
+    missing_drivers = [gcm for gcm in DRIVING_GCMS if (gcm, DRIVING_GCMS[gcm]) not in set(usable)]
+    assert not missing_drivers, f"driving GCM(s) not usable: {missing_drivers}"
 
     for gcm, member in usable:
         fields = {}
-        for var in ("tas", "pr"):
-            hits = sorted(Path(args.cmip5ng, var).glob(
-                f"{var}_ann_{gcm}_{args.scenario}_{member}_g025.nc"))
-            assert len(hits) == 1, f"expected one {var} file for {gcm} {member}, found {hits}"
-            fields[var] = xr.open_dataset(hits[0])[var].sel(**EXTENT)
+        for variable in ("tas", "pr"):
+            hits = sorted(Path(args.cmip5ng, variable).glob(
+                f"{variable}_ann_{gcm}_{args.scenario}_{member}_g025.nc"))
+            assert len(hits) == 1, f"expected one {variable} file for {gcm} {member}, found {hits}"
+            # cmip5-ng longitudes run 0-360; move them to -180-180 so that EXTENT keeps the
+            # cells west of Greenwich.
+            field = xr.open_dataset(hits[0])[variable]
+            field = field.assign_coords(lon=((field["lon"] + 180) % 360) - 180).sortby("lon")
+            fields[variable] = field.sel(**EXTENT)
+            longitudes = fields[variable]["lon"]
+            assert float(longitudes.min()) < -10 and float(longitudes.max()) > 37, \
+                f"{hits[0].name}: the selected longitudes do not span the analysis box"
         driving = DRIVING_GCMS.get(gcm) == member
         for level in args.warming_levels:
             window = windows[(gcm, member)][args.scenario][level]
@@ -217,7 +233,7 @@ if "gcm" in args.sources:
             rows.append(dict(source="gcm", model=f"{gcm}_{member}", ensemble=member,
                              rcm=None, gcm=gcm, driving=driving, warming_level=level,
                              tas_degC=area_mean(fields["tas"].sel(year=years).mean("year")) - 273.15,
-                             # cmip5-ng pr is kg m-2 s-1; CORDEX pr was converted the same way.
+                             # cmip5-ng pr is in kg m-2 s-1.
                              pr_mm_per_day=area_mean(fields["pr"].sel(year=years).mean("year")) * 86400.0))
         if driving:
             print(f"       driver {gcm:<12} {member}", flush=True)
@@ -236,7 +252,7 @@ if "cerra" in args.sources:
     rows.append(dict(source="cerra", model="CERRA", ensemble=None, rcm=None, gcm=None,
                      driving=False, warming_level=np.nan,
                      tas_degC=tas_mean, pr_mm_per_day=pr_mean))
-    # A unit slip here would be invisible on the figure — it would just move the reference point.
+    # Plausibility checks against unit errors.
     assert 5.0 < tas_mean < 15.0, f"European mean CERRA temperature {tas_mean:.2f} degC is implausible"
     assert 1.0 < pr_mean < 5.0, f"European mean CERRA precipitation {pr_mean:.2f} mm/d is implausible"
     print(f"  cerra {REFERENCE_PERIOD[0]}-{REFERENCE_PERIOD[1]}: "
@@ -249,4 +265,5 @@ if out_path.exists() and set(args.sources) != {"gcm", "rcm", "cerra"}:
 frame = frame.sort_values(["source", "model", "warming_level"]).reset_index(drop=True)
 frame.to_csv(out_path, index=False)
 print(f"\nwrote {out_path}  ({len(frame)} rows: "
-      + ", ".join(f"{n} {s}" for s, n in frame['source'].value_counts().items()) + ")")
+      + ", ".join(f"{count} {source}" for source, count in frame['source'].value_counts().items())
+      + ")")

@@ -1,43 +1,34 @@
-"""Compute per-model GWL-period gridded means of the BIAS-CORRECTED EURO-CORDEX climate variables.
+"""Per-chain warming-level means of the bias-corrected EURO-CORDEX climate variables.
 
-The sibling script ``compute_energy_means_gwl.py`` does this for the derived energy fields (PV and
-wind capacity factors).  This one does it for the *climate* variables those fields are built from, so
-the supplementary material can show the underlying signal.
+For each warming level, every chain's bias-corrected field is averaged over that chain's own
+20-year window, annually or per season, and the chains are stacked on a ``model`` dimension.
+Output: ``<processed>/energy/analysis/<aggregation>/gwl/mean_gwl_<level x 10>_climate[_<season
+type>].nc``. The energy counterpart (PV and wind capacity factors) is
+``compute_energy_means_gwl.py``.
 
-Why a script and not a notebook cell: ``cordex_processed`` is ~53 TB, and a single bias-corrected
-3-hourly variable is 166-270 GB **per model** (0.1 deg, lat 426 x lon 710, 1991-2100).  A 9-model x
-3-GWL x 20-year mean is hundreds of GB of reads per variable.  The output is ~23 MB (annual) /
-~94 MB (seasonal) per GWL, which a notebook then loads instantly.
+Variables:
 
-Variables — the five that drive every conversion in the pipeline:
+    tas      near-surface air temperature    (heating and cooling demand)
+    rsds     surface downwelling shortwave   (PV)
+    sfcWind  near-surface wind speed         (wind power)
+    pr       precipitation                   (hydropower)
+    mrro     total runoff                    (hydropower)
+    Qrouted  routed river discharge (mRM)    (hydropower)
 
-    tas      3-hourly   near-surface air temperature   -> heating / cooling demand
-    rsds     3-hourly   surface downwelling shortwave  -> PV
-    sfcWind  3-hourly   near-surface wind speed        -> wind power
-    pr       daily      precipitation                  -> hydro
-    mrro     daily      total runoff                   -> hydro
+``tas``, ``rsds`` and ``sfcWind`` are read from the daily store where it exists and from the
+3-hourly store otherwise; the two give the same period mean to float32 rounding. This holds for
+the mean only: a statistic that is not linear in time must read the 3-hourly store.
 
-``tas``, ``rsds`` and ``sfcWind`` exist in both a daily and a 3-hourly store.  We read the **daily** one
-where it exists and fall back to 3-hourly only for the two chains that lack it (MOHC-HadREM3-GA7-05 x
-MPI-ESM-LR and x NorESM1-M), so all nine chains are always present — the script asserts this.
+Each variable carries a ``change_type`` attribute, ``"absolute"`` (``tas``) or ``"percent"``,
+which the figures use to express the change between levels.
 
-That substitution is safe *because we only take a mean*: verified on a chain that has both stores, the
-period-mean field is identical to float32 rounding (max |diff| = 2e-4 K for tas, 1e-4 W m-2 for rsds,
-2e-6 m s-1 for sfcWind).  It is worth ~8x less I/O (daily tas is 24 GB/model, 3-hourly is 191 GB).
-NOTE: this equivalence holds for the MEAN only.  Any future statistic that is not linear in time
-(a quantile, an exceedance count, a diurnal cycle) MUST read the 3-hourly store.
+``mrro`` is on a different grid from the other variables (cell centres offset by half a cell), so
+every period mean is interpolated onto the 3-hourly ``tas`` grid of the first chain, and the
+variables are merged with ``join="exact"``.
 
-Each variable carries a ``change_type`` attribute (``"absolute"`` or ``"percent"``) that the plotting
-notebook MUST honour: a percentage change in Kelvin is meaningless, so ``tas`` is absolute.
-
-``mrro`` is stored on a DIFFERENT grid from the others (lat 20.90-71.80, lon -51.70-72.70, cell centres
-offset by half a cell — zero coordinates in common with tas/rsds/sfcWind/pr).  Merging naively would
-silently produce a union grid on which the variables never overlap.  Every field is therefore
-interpolated onto one reference grid after the temporal mean (cheap: the climatology is 2-D), and the
-final merge uses ``join="exact"`` so any future grid mismatch fails loudly instead of padding with NaN.
-
-Example:
-    python compute_climate_means_gwl.py --dry_run                 # 1 model, small extent, +1.5 only
+Examples
+--------
+    python compute_climate_means_gwl.py --dry_run    # one chain, small extent, first level
     python compute_climate_means_gwl.py
     python compute_climate_means_gwl.py --aggregation seasonal
 """
@@ -56,18 +47,16 @@ from cordex2energy_analysis.analysis import compute_seasonal_statistics
 from cordex2energy_analysis.extremes_analysis import resolve_gwl_period_definitions
 
 # ── Variable spec ──────────────────────────────────────────────────────────────
-# resolution: which bias_corrected store to read.  change_type: how the notebook must display the
-# change vs the reference GWL (a % change in Kelvin is meaningless).
-# "resolution": stores to try, in order of preference (daily first: 8x less I/O, identical mean).
+# "resolution": bias-corrected stores to try, in order of preference. "source": "routed" for the
+# mRM discharge, read by open_routed_runoff. "change_type": how the change between levels is
+# expressed.
 VARIABLES = {
     "tas":     {"resolution": ["day", "3hr"], "change_type": "absolute", "long_name": "Near-surface air temperature"},
     "rsds":    {"resolution": ["day", "3hr"], "change_type": "percent",  "long_name": "Surface downwelling shortwave radiation"},
     "sfcWind": {"resolution": ["day", "3hr"], "change_type": "percent",  "long_name": "Near-surface wind speed"},
     "pr":      {"resolution": ["day"],        "change_type": "percent",  "long_name": "Precipitation"},
     "mrro":    {"resolution": ["day"],        "change_type": "percent",  "long_name": "Total runoff"},
-    # Routed runoff: the bias-corrected mrro passed through the mRM routing model — river-channel
-    # discharge, not grid-cell runoff. Lives in a separate tree (5-year folders, global 0.1 deg daily),
-    # so it is read by open_routed_runoff, not from cordex_processed/bias_corrected.
+    # River-channel discharge: the bias-corrected mrro passed through the mRM routing model.
     "Qrouted": {"source": "routed",           "change_type": "percent",  "long_name": "Routed runoff (mRM)"},
 }
 
@@ -84,7 +73,8 @@ parser.add_argument("--variables", type=str, nargs="+", default=list(VARIABLES),
 parser.add_argument("--dry_run", action="store_true", help="1 model, small extent, first GWL only — for validation")
 args = parser.parse_args()
 
-paths = json.load(open(args.paths_file))
+with open(args.paths_file) as handle:
+    paths = json.load(handle)
 path_data_processed = Path(paths["path_data_processed"])
 climate_scenario = args.scenario
 aggregation = args.aggregation
@@ -102,16 +92,17 @@ extent = (
 )
 
 # ── Discover the chains ────────────────────────────────────────────────────────
-chain_dirs = sorted(p for p in path_cordex.glob(f"*_{climate_scenario}") if p.is_dir())
-models = [p.name[: -len(f"_{climate_scenario}")] for p in chain_dirs]
+chain_dirs = sorted(folder for folder in path_cordex.glob(f"*_{climate_scenario}")
+                    if folder.is_dir())
+models = [folder.name[: -len(f"_{climate_scenario}")] for folder in chain_dirs]
 if args.dry_run:
     chain_dirs, models = chain_dirs[:1], models[:1]
 print(f"Chains ({len(models)}):")
-for m in models:
-    print(f"  {m}")
+for model in models:
+    print(f"  {model}")
 
 # ── Per-model GWL windows ──────────────────────────────────────────────────────
-period_defs, _, _ = resolve_gwl_period_definitions(
+period_windows, _, _ = resolve_gwl_period_definitions(
     warming_levels=warming_levels,
     models=models,
     chain_meta_path=args.models_json,
@@ -119,86 +110,138 @@ period_defs, _, _ = resolve_gwl_period_definitions(
     climate_scenario=climate_scenario,
 )
 print("\nGWL windows resolved:")
-for label, windows in period_defs.items():
+for label, windows in period_windows.items():
     print(f"  {label}: {len(windows)}/{len(models)} chains")
 
 
-USED_STORE: dict[tuple[str, str], str] = {}   # (model, variable) -> "day" | "3hr" | "routed"
+#: Store each (chain, variable) was read from: "day", "3hr" or "routed".
+USED_STORE: dict[tuple[str, str], str] = {}
 
-# Routed runoff lives outside cordex_processed, in per-chain 5-year folders.
+#: Root of the mRM routed-runoff output (per-chain folders of 5-year sub-folders).
 PATH_ROUTED = Path("/net/land/landclim/pseubert/out_rcm/hist")
 
 
 def open_routed_runoff(model: str) -> xr.DataArray:
-    """One chain's routed runoff (mRM): global daily river discharge, concatenated across the 5-year
-    folders and cropped to the extent.
+    """One chain's routed river discharge (mRM), on the standard calendar, cropped to the extent.
 
-    Not in cordex_processed — the mRM output lives in its own tree, split into 5-year subfolders, on a
-    global 0.1 deg grid.  Cropping on open keeps only the European window (the field is otherwise
-    global).  The '_new' suffix matches preprocess_cordex.py; fall back to any Qrouted zarr otherwise.
+    Parameters
+    ----------
+    model : str
+        Chain identifier.
+
+    Returns
+    -------
+    xarray.DataArray
+        Daily ``Qrouted``, the 5-year stores concatenated along time without duplicates.
+
+    Notes
+    -----
+    Stores named ``Qrouted_*_new.zarr`` are preferred; any ``Qrouted_*.zarr`` is the fallback.
     """
     base = PATH_ROUTED / f"{model}_{climate_scenario}"
     stores = sorted(glob.glob(str(base / "*" / "Qrouted_*_new.zarr"))
                     or glob.glob(str(base / "*" / "Qrouted_*.zarr")))
     if not stores:
         raise FileNotFoundError(f"no Qrouted zarr under {base}")
-    parts = [sel_extent(xr.open_zarr(s, chunks="auto").sortby("lat"), extent=extent)["Qrouted"]
-             for s in stores]
-    da = xr.concat(parts, dim="time").sortby("time").drop_duplicates("time")
-    da = da.convert_calendar("standard", align_on="year")
+    parts = [sel_extent(xr.open_zarr(store, chunks="auto").sortby("lat"), extent=extent)["Qrouted"]
+             for store in stores]
+    discharge = xr.concat(parts, dim="time").sortby("time").drop_duplicates("time")
+    discharge = discharge.convert_calendar("standard", align_on="year")
     USED_STORE[(model, "Qrouted")] = "routed"
-    return da
+    return discharge
 
 
 def open_variable(model: str, variable: str) -> xr.DataArray:
     """One chain's variable, on the standard calendar, cropped to the extent.
 
-    The bias-corrected stores are on a 365-day (no-leap) calendar; converting to standard here means
-    the GWL window slices and the season grouping behave like every other dataset in the analysis.
+    Parameters
+    ----------
+    model : str
+        Chain identifier.
+    variable : str
+        Key of :data:`VARIABLES`.
+
+    Returns
+    -------
+    xarray.DataArray
+        The variable from the first existing store of its ``"resolution"`` list (or the routed
+        discharge), converted from the stores' no-leap calendar to the standard one.
+
+    Raises
+    ------
+    FileNotFoundError
+        If no store exists.
     """
     if VARIABLES[variable].get("source") == "routed":
         return open_routed_runoff(model)
     base = path_cordex / f"{model}_{climate_scenario}" / "bias_corrected"
-    tried = [base / res / f"{variable}.zarr" for res in VARIABLES[variable]["resolution"]]
-    store = next((s for s in tried if s.exists()), None)
+    tried = [base / resolution / f"{variable}.zarr"
+             for resolution in VARIABLES[variable]["resolution"]]
+    store = next((candidate for candidate in tried if candidate.exists()), None)
     if store is None:
         raise FileNotFoundError(
-            f"no store for {variable} / {model} — tried {[str(t) for t in tried]}")
+            f"no store for {variable} / {model} — tried {[str(path) for path in tried]}")
     USED_STORE[(model, variable)] = store.parent.name
-    ds = xr.open_zarr(store, chunks="auto")
-    ds = ds.convert_calendar("standard", align_on="year").sortby("lat")
-    return sel_extent(ds, extent=extent)[variable]
+    dataset = xr.open_zarr(store, chunks="auto")
+    dataset = dataset.convert_calendar("standard", align_on="year").sortby("lat")
+    return sel_extent(dataset, extent=extent)[variable]
 
 
-# One reference grid for every variable.  tas/rsds/sfcWind/pr already share it; mrro does not.
-_ref = sel_extent(xr.open_zarr(path_cordex / f"{models[0]}_{climate_scenario}"
-                               / "bias_corrected" / "3hr" / "tas.zarr", chunks="auto"),
-                  extent=extent)
-REF_LAT, REF_LON = _ref["lat"], _ref["lon"]
+# One reference grid for every variable: tas/rsds/sfcWind/pr already share it, mrro does not.
+_reference_grid = sel_extent(xr.open_zarr(path_cordex / f"{models[0]}_{climate_scenario}"
+                                          / "bias_corrected" / "3hr" / "tas.zarr", chunks="auto"),
+                             extent=extent)
+REF_LAT, REF_LON = _reference_grid["lat"], _reference_grid["lon"]
 print(f"\nReference grid: lat[{REF_LAT.size}] lon[{REF_LON.size}]")
 
 
-def to_reference_grid(da: xr.DataArray) -> xr.DataArray:
-    """Put a period-mean field on the reference grid (a no-op for the four that already are)."""
-    same = (da.sizes.get("lat") == REF_LAT.size and da.sizes.get("lon") == REF_LON.size
-            and np.allclose(da["lat"].values, REF_LAT.values)
-            and np.allclose(da["lon"].values, REF_LON.values))
+def to_reference_grid(field: xr.DataArray) -> xr.DataArray:
+    """Put a period-mean field on the reference grid.
+
+    Parameters
+    ----------
+    field : xarray.DataArray
+        Field on ``(lat, lon)``.
+
+    Returns
+    -------
+    xarray.DataArray
+        The field with the reference coordinates assigned if its grid already matches (to
+        floating-point tolerance), else linearly interpolated onto the reference grid.
+    """
+    same = (field.sizes.get("lat") == REF_LAT.size and field.sizes.get("lon") == REF_LON.size
+            and np.allclose(field["lat"].values, REF_LAT.values)
+            and np.allclose(field["lon"].values, REF_LON.values))
     if same:
-        return da.assign_coords(lat=REF_LAT, lon=REF_LON)   # kill float noise, keep the values
-    return da.interp(lat=REF_LAT, lon=REF_LON, method="linear")
+        return field.assign_coords(lat=REF_LAT, lon=REF_LON)   # drop float noise, keep the values
+    return field.interp(lat=REF_LAT, lon=REF_LON, method="linear")
 
 
-def temporal_mean(da: xr.DataArray, window) -> xr.DataArray:
-    """Climatological mean over one GWL window — annual, or one value per season."""
-    da = da.sel(time=slice(*window))
+def temporal_mean(series: xr.DataArray, window) -> xr.DataArray:
+    """Climatological mean over one warming-level window.
+
+    Parameters
+    ----------
+    series : xarray.DataArray
+        Time series of one chain.
+    window : tuple of str
+        ``(first year, last year)``.
+
+    Returns
+    -------
+    xarray.DataArray
+        With ``--aggregation annual``, the mean of the yearly means (every year weighs the same);
+        with ``seasonal``, one mean per season (see
+        :func:`~cordex2energy_analysis.analysis.compute_seasonal_statistics`).
+    """
+    series = series.sel(time=slice(*window))
     if aggregation == "seasonal":
-        seasonal = compute_seasonal_statistics(da.to_dataset(), time_dim="time", method="mean",
+        seasonal = compute_seasonal_statistics(series.to_dataset(), time_dim="time", method="mean",
                                                season_type=season_type)
         if season_type == "meteorological":
             return seasonal.groupby("season").mean(dim="time", skipna=True).compute()
         return seasonal.mean(dim="year", skipna=True).compute()
-    # annual: reduce to yearly means first so every year weighs the same, then average the years
-    return da.resample(time="YE").mean("time", skipna=True).mean("time", skipna=True).compute()
+    return series.resample(time="YE").mean("time", skipna=True).mean("time", skipna=True).compute()
 
 
 # ── Compute + save one file per GWL ────────────────────────────────────────────
@@ -206,9 +249,9 @@ season_suffix = f"_{season_type}" if aggregation == "seasonal" else ""
 out_dir = path_data_processed / "energy" / "analysis" / aggregation / "gwl"
 out_dir.mkdir(parents=True, exist_ok=True)
 
-for wl in warming_levels:
-    label = f"+{wl:.1f}°C"
-    tag = f"{int(round(wl * 10))}"
+for warming_level in warming_levels:
+    label = f"+{warming_level:.1f}°C"
+    tag = f"{int(round(warming_level * 10))}"
     print(f"\n=== GWL {label} ({aggregation}"
           f"{', ' + season_type if aggregation == 'seasonal' else ''}) ===")
 
@@ -218,39 +261,40 @@ for wl in warming_levels:
         print(f"  {variable} ({source}) …")
         per_model = []
         with ProgressBar(dt=10):
-            # Deliberately per-model rather than concat-then-slice: each chain has its own GWL window,
-            # and concatenating first would force an alignment of time coords across chains that the
-            # calendar conversion does not guarantee.
+            # Per chain, not concatenate-then-slice: each chain has its own window, and
+            # concatenating first would align time coordinates across chains.
             for model in models:
-                window = period_defs[label].get(model)
+                window = period_windows[label].get(model)
                 if window is None:
                     print(f"    [skip {model}: no {label} window]")
                     continue
-                mean_m = to_reference_grid(temporal_mean(open_variable(model, variable), window))
-                per_model.append(mean_m.expand_dims(model=[model]))
+                chain_mean = to_reference_grid(temporal_mean(open_variable(model, variable), window))
+                per_model.append(chain_mean.expand_dims(model=[model]))
 
         merged = xr.concat(per_model, dim="model")
         if isinstance(merged, xr.Dataset):
             merged = merged[variable]
         merged.attrs.update(
-            change_type=VARIABLES[variable]["change_type"],       # the notebook MUST honour this
+            change_type=VARIABLES[variable]["change_type"],
             long_name=VARIABLES[variable]["long_name"],
             native_resolution=str(VARIABLES[variable].get("resolution",
                                                           VARIABLES[variable].get("source"))),
         )
         per_variable.append(merged.rename(variable))
 
-        n = merged.sizes["model"]
+        n_chains = merged.sizes["model"]
         if not args.dry_run:
-            assert n == len(models), f"{variable}: only {n}/{len(models)} chains — a store is missing"
-        stores = [USED_STORE[(m, variable)] for m in models if (m, variable) in USED_STORE]
+            assert n_chains == len(models), \
+                f"{variable}: only {n_chains}/{len(models)} chains — a store is missing"
+        stores = [USED_STORE[(model, variable)] for model in models
+                  if (model, variable) in USED_STORE]
         detail = (f"{stores.count('routed')} routed" if "routed" in stores
                   else f"{stores.count('day')} day / {stores.count('3hr')} 3hr")
-        print(f"    -> {n} chains ({detail}), mean = {float(merged.mean()):.3f}")
+        print(f"    -> {n_chains} chains ({detail}), mean = {float(merged.mean()):.3f}")
 
-    # join="exact": a grid mismatch must raise, not silently NaN-pad (see the mrro note above)
-    ds_out = xr.merge(per_variable, join="exact")
-    ds_out.attrs.update(
+    # join="exact": a grid mismatch raises instead of padding with NaN.
+    output = xr.merge(per_variable, join="exact")
+    output.attrs.update(
         description="Per-model GWL-window means of the bias-corrected EURO-CORDEX climate variables",
         warming_level=label,
         scenario=climate_scenario,
@@ -258,7 +302,7 @@ for wl in warming_levels:
     out_path = out_dir / f"mean_gwl_{tag}_climate{season_suffix}.nc"
     if out_path.exists():
         out_path.unlink()
-    ds_out.to_netcdf(out_path)
+    output.to_netcdf(out_path)
     print(f"  Saved: {out_path}  ({out_path.stat().st_size / 1e6:.1f} MB)")
 
 print("\nDone.")
