@@ -1,11 +1,11 @@
-"""Every figure reference resolves, and each SI section's heading, stem and caption agree.
+"""Every figure reference resolves, and each SI section's heading and figure stems agree.
 
 * main figures: `figs/paper_publication/figN.pdf`; SI: `figs/si_note*/SN_*.pdf` (+ EXTERNAL_SI)
 * both numberings contiguous from 1
 * every "Figure N" / "Fig. N" / "Supplementary Fig. SN" / "Supplementary Figure N" in the notebooks'
   markdown and code and in doc/paper_summary.md points at a rendered figure
-* inside each note, the section heading `## k · SN:`, the next `save()` stem `SN_...` and the caption
-  `**Supplementary Figure N |` carry the same N
+* inside each note, the section heading (`## SN - ...`) and the figure stems `SN_...` written under it
+  carry the same N
 
 Passing says every number EXISTS; it cannot say a citation means what its sentence claims.
 Read citations by meaning after any renumber.
@@ -72,7 +72,7 @@ for name in NOTEBOOKS[1:]:
                 if current is not None and int(cap) not in current:
                     bad.append(f"caption {cap} under heading S{sorted(current)}")
         else:
-            for stem in re.findall(r'save\((?:fig|_fig), "S(\d+)_', src):
+            for stem in re.findall(r'"S(\d+)_\w+"', src):
                 if current is not None and int(stem) not in current:
                     bad.append(f"stem S{stem} under heading S{sorted(current)}")
     print(f"  {name:<32} {'checked' if not bad else bad}")
